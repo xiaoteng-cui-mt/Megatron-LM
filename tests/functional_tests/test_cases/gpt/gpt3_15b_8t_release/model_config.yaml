@@ -25,7 +25,7 @@ MODEL_ARGS:
   --micro-batch-size: 4
   --rampup-batch-size: "384 384 97656250"
   --global-batch-size: 1152
-  --train-samples: 19531250
+  --train-samples: 4882812
   --manual-gc: true
 
   # Transformer Engine args
@@ -94,7 +94,7 @@ MODEL_ARGS:
   --log-interval: 100
   --tensorboard-dir: ${OUTPUT_PATH}/tensorboard
   --wandb-project: megatron-core-release-runs
-  --wandb-exp-name: ${MCORE_RELEASE_NUM}_gpt3-15b-8t
+  --wandb-exp-name: ${WANDB_EXPERIMENT}
 
   # Add mixed precision args
   --bf16: true
