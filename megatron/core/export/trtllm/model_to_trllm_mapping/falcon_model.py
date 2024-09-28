@@ -14,9 +14,10 @@ FALCON_DICT = {
     'decoder.layers.self_attention.linear_qkv.layer_norm_weight': TRTLLMLayers.input_layernorm_weight,
     'decoder.layers.self_attention.linear_proj.weight': TRTLLMLayers.attention_dense_weight,
     # MLP
+    'decoder.layers.pre_mlp_layernorm.weight': TRTLLMLayers.post_layernorm_weight,
+    'decoder.layers.pre_mlp_layernorm.bias': TRTLLMLayers.post_layernorm_bias,
     'decoder.layers.mlp.linear_fc1.weight': TRTLLMLayers.mlp_fc_weight,
     'decoder.layers.mlp.linear_fc2.weight': TRTLLMLayers.mlp_projection_weight,
-    'decoder.layers.mlp.linear_fc1.layer_norm_weight': TRTLLMLayers.post_layernorm_weight,
     # FINAL LAYER NORM
     'decoder.final_layernorm.weight': TRTLLMLayers.final_layernorm_weight,
     'decoder.final_layernorm.bias': TRTLLMLayers.final_layernorm_bias,
