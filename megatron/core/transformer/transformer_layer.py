@@ -444,14 +444,16 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.bias_dropout_add_exec_handler = torch.enable_grad
         
         
-        if config.offload_moe_fc1_input or config.offload_moe_fused_swiglu_input:
-            from transformer_engine.pytorch.cpu_offload import get_fine_grained_offload_handler
-            if isinstance(self.mlp, MoELayer):
-                get_fine_grained_offload_handler().moe_layer_pattern.append(1)
-            elif isinstance(self.mlp, MLP):
-                get_fine_grained_offload_handler().moe_layer_pattern.append(0)
-            else:
-                raise ValueError("selective activation offload only support TransformerLayer with isinstance(self.mlp, MoELayer) or isinstance(self.mlp, MLP).")
+        # if config.offload_moe_fc1_input or config.offload_moe_fused_swiglu_input:
+        from transformer_engine.pytorch.cpu_offload import get_fine_grained_offload_handler
+        if isinstance(self.mlp, MoELayer):
+            get_fine_grained_offload_handler().moe_layer_pattern.append(1)
+            # print("moe_layer_pattern.append(1)")
+        elif isinstance(self.mlp, MLP):
+            get_fine_grained_offload_handler().moe_layer_pattern.append(0)
+            # print("moe_layer_pattern.append(0)")
+        else:
+            raise ValueError("selective activation offload only support TransformerLayer with isinstance(self.mlp, MoELayer) or isinstance(self.mlp, MLP).")
                 
 
     @staticmethod

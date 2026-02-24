@@ -321,6 +321,9 @@ class TransformerBlock(MegatronModule):
 
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
+        
+        get_fine_grained_offload_handler().num_layers = len(self.layers)
+        get_fine_grained_offload_handler().pp_size = self.config.pipeline_model_parallel_size
 
     def _build_layers(self):
         # Transformer layers.
@@ -408,11 +411,6 @@ class TransformerBlock(MegatronModule):
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                         )
-                        if self.config.offload_moe_fc1_input or self.config.offload_moe_fused_swiglu_input:
-                            hidden_states = FineGrainedOffloadLayerCounter.apply(hidden_states)
-                            hidden_states = make_viewless_tensor(
-                                inp=hidden_states, requires_grad=True, keep_graph=True
-                            )
 
                 return hidden_states, context
 
@@ -575,9 +573,6 @@ class TransformerBlock(MegatronModule):
         use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
         use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
-
-        get_fine_grained_offload_handler().num_layers = len(self.layers)
-        get_fine_grained_offload_handler().pp_size = self.config.pipeline_model_parallel_size
 
         with rng_context, outer_fp8_context:
             # Forward pass.
