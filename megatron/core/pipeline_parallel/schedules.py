@@ -599,7 +599,6 @@ def forward_backward_no_pipelining(
     else:
         with no_sync_func():
             for i in range(num_microbatches - 1):
-                get_fine_grained_offload_handler().start_microbatch_forward(i)
                 output_tensor, num_tokens = forward_step(
                     forward_step_func,
                     data_iterator,
@@ -621,7 +620,6 @@ def forward_backward_no_pipelining(
                     )
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
-        get_fine_grained_offload_handler().start_microbatch_forward(num_microbatches - 1)
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -782,6 +780,35 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
                 [
                     (microbatch_id, model_chunk_id)
                     for model_chunk_id in range(num_model_chunks)
+                    for microbatch_id in range(
+                        min_microbatch_id_in_group,
+                        min_microbatch_id_in_group + microbatch_group_size_per_vp_stage,
+                    )
+                ]
+            )
+    return schedule_table
+
+def get_schedule_table_backward(num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage):
+    """Get the schedule table for PP scheduling on backward batch."""
+    schedule_table = []
+    for min_microbatch_id_in_group in range(
+        0, num_microbatches, microbatch_group_size_per_vp_stage
+    ):
+        if min_microbatch_id_in_group + microbatch_group_size_per_vp_stage >= num_microbatches:
+            # Construct schedule for the last microbatch group
+            schedule_table.extend(
+                [
+                    (microbatch_id, model_chunk_id)
+                    for model_chunk_id in range(num_model_chunks-1, -1, -1)
+                    for microbatch_id in range(min_microbatch_id_in_group, num_microbatches)
+                ]
+            )
+        else:
+            # Construct schedule for other microbatch groups
+            schedule_table.extend(
+                [
+                    (microbatch_id, model_chunk_id)
+                    for model_chunk_id in range(num_model_chunks-1, -1, -1)
                     for microbatch_id in range(
                         min_microbatch_id_in_group,
                         min_microbatch_id_in_group + microbatch_group_size_per_vp_stage,
@@ -1057,6 +1084,15 @@ def forward_backward_pipelining_with_interleaving(
         num_microbatches, len(model), config.microbatch_group_size_per_vp_stage
     )
 
+    # print(f"total_num_microbatches = {total_num_microbatches}, are_all_microbatches_in_warmup = {are_all_microbatches_in_warmup}, num_warmup_microbatches = {num_warmup_microbatches}, num_microbatches_remaining = {num_microbatches_remaining}")
+    # print(f"num_microbatches: {num_microbatches}, num_model_chunks = len(model) = {len(model)}, config.microbatch_group_size_per_vp_stage = {config.microbatch_group_size_per_vp_stage}")
+    get_fine_grained_offload_handler().num_model_chunks = num_model_chunks
+    get_fine_grained_offload_handler().schedule_table_backward = get_schedule_table_backward(
+        num_microbatches, len(model), config.microbatch_group_size_per_vp_stage
+    )
+    
+    for i in range(len(schedule_table)):
+        get_fine_grained_offload_handler().microbatch_id_chunk_id_to_virtual_batch_id_backward[(get_fine_grained_offload_handler().schedule_table_backward[i][0], get_fine_grained_offload_handler().schedule_table_backward[i][1])] = i
     # Decouple individual lookup table for microbatch_id and model_chunk_id.
     # For example, the micro-batch table for PP2 N3M5 with VP2 is
     # virtual_microbatch_id | 0 1 2 3 4 5 6 7 8 9
@@ -1159,7 +1195,8 @@ def forward_backward_pipelining_with_interleaving(
 
     def forward_step_helper_preprocess(virtual_microbatch_id, model_chunk_id, microbatch_id):
         """Preprocess for forward_step_helper"""
-        get_fine_grained_offload_handler().start_microbatch_backward(virtual_microbatch_id)
+        forward_layer_id_in_pipeline = model_chunk_id * get_fine_grained_offload_handler().num_layers
+        get_fine_grained_offload_handler().start_microbatch_forward(microbatch_id, current_layer_id = forward_layer_id_in_pipeline)
         # launch param synchronization for next model chunk
         # Note: Asynchronous communication tends to slow down compute.
         # To reduce idling from mismatched microbatch times, we launch
@@ -1245,7 +1282,9 @@ def forward_backward_pipelining_with_interleaving(
 
     def backward_step_helper_preprocess(virtual_microbatch_id, model_chunk_id):
         """Preprocess for backward_step_helper"""
-        get_fine_grained_offload_handler().start_microbatch_backward(virtual_microbatch_id)
+        backward_layer_id_in_pipeline = (model_chunk_id + 1) * get_fine_grained_offload_handler().num_layers
+        microbatch_id = get_microbatch_id_in_model_chunk(virtual_microbatch_id, forward=True)
+        get_fine_grained_offload_handler().start_microbatch_backward(microbatch_id, current_layer_id = backward_layer_id_in_pipeline)
         # launch grad synchronization (default)
         if config.grad_sync_func is None and is_last_microbatch_for_model_chunk(
             virtual_microbatch_id
@@ -1313,6 +1352,7 @@ def forward_backward_pipelining_with_interleaving(
         post_forward=None,
         post_backward=None,
         checkpoint_activations_microbatch=None,
+        finish_warm_up=None,
     ):
         """
         wrap forward_helper, backward_helper, and combined_forward_backward_helper in a unified way
@@ -1352,6 +1392,15 @@ def forward_backward_pipelining_with_interleaving(
                 forward_output_tensor = forward_step_helper(
                     f_virtual_microbatch_id, checkpoint_activations_microbatch
                 )
+                if finish_warm_up == True:
+                    # print(f"finish warm up -> get_fine_grained_offload_handler().current_layer_id = {get_fine_grained_offload_handler().current_layer_id}, f_virtual_microbatch_id = {f_virtual_microbatch_id}, b_virtual_microbatch_id = {b_virtual_microbatch_id}")
+                    reloading_microbatch_id = 0
+                    reloading_layer_id = num_model_chunks * get_fine_grained_offload_handler().num_layers - 1
+                    get_fine_grained_offload_handler().current_layer_id = num_model_chunks * get_fine_grained_offload_handler().num_layers - 1
+                    if config.offload_moe_fc1_input:
+                        get_fine_grained_offload_handler().launch_reload('moe_fc1_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
+                    if config.offload_moe_fused_swiglu_input:
+                        get_fine_grained_offload_handler().launch_reload('moe_fused_swiglu_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
                 if post_forward is not None:
                     forward_output_tensor = post_forward(forward_output_tensor)
 
@@ -1360,6 +1409,12 @@ def forward_backward_pipelining_with_interleaving(
                 backward_model_chunk_id = get_model_chunk_id(b_virtual_microbatch_id, forward=False)
                 if pre_backward is not None:
                     pre_backward()
+                if finish_warm_up == True:
+                    if config.offload_moe_fc1_input:
+                        get_fine_grained_offload_handler().wait_reload('moe_fc1_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
+                    if config.offload_moe_fused_swiglu_input:
+                        get_fine_grained_offload_handler().wait_reload('moe_fused_swiglu_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
+                    
                 backward_input_tensor_grad = backward_step_helper(b_virtual_microbatch_id)
                 if post_backward is not None:
                     backward_input_tensor_grad = post_backward(backward_input_tensor_grad)
@@ -1720,6 +1775,7 @@ def forward_backward_pipelining_with_interleaving(
                 post_forward=pp_post_forward,
                 post_backward=pp_post_backward,
                 checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                finish_warm_up = (k==0),
             )
 
         else:  # No p2p overlap.
@@ -1728,6 +1784,7 @@ def forward_backward_pipelining_with_interleaving(
                 f_virtual_microbatch_id=forward_k,
                 b_virtual_microbatch_id=backward_k,
                 checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                finish_warm_up = (k==0),
             )
             # Send output_tensor and input_tensor_grad, receive input_tensor
             # and output_tensor_grad.
@@ -2224,7 +2281,7 @@ def forward_backward_pipelining_without_interleaving(
         else:
             get_fine_grained_offload_handler().start_microbatch_backward(i)
             if i==0:
-                reloading_microbatch_id = i
+                reloading_microbatch_id = 0
                 reloading_layer_id = get_fine_grained_offload_handler().num_layers - 1
                 get_fine_grained_offload_handler().current_layer_id -= 1
                 if config.offload_moe_fc1_input:
@@ -2302,6 +2359,18 @@ def forward_backward_pipelining_without_interleaving(
             if i == num_warmup_microbatches - 1:
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
+            
+            get_fine_grained_offload_handler().start_microbatch_backward(num_microbatches_remaining + i)
+            if num_microbatches_remaining == 0:
+                if i==0:
+                    reloading_microbatch_id = 0
+                    reloading_layer_id = get_fine_grained_offload_handler().num_layers - 1
+                    get_fine_grained_offload_handler().current_layer_id -= 1
+                    if config.offload_moe_fc1_input:
+                        get_fine_grained_offload_handler().launch_reload('moe_fc1_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
+                    if config.offload_moe_fused_swiglu_input:
+                        get_fine_grained_offload_handler().launch_reload('moe_fused_swiglu_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
+                    get_fine_grained_offload_handler().current_layer_id += 1
 
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
@@ -2310,7 +2379,15 @@ def forward_backward_pipelining_without_interleaving(
                 send_tensor_shapes, is_pp_last_stage(p2p_communicator.pp_group)
             )
 
-            get_fine_grained_offload_handler().start_microbatch_backward(num_microbatches_remaining + i)
+            if num_microbatches_remaining == 0:
+                if i==0:
+                    get_fine_grained_offload_handler().current_layer_id -= 1
+                    if config.offload_moe_fc1_input:
+                        get_fine_grained_offload_handler().wait_reload('moe_fc1_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
+                    if config.offload_moe_fused_swiglu_input:
+                        get_fine_grained_offload_handler().wait_reload('moe_fused_swiglu_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
+                    get_fine_grained_offload_handler().current_layer_id += 1
+                
             input_tensor_grad = backward_step(
                 input_tensor,
                 output_tensor,
