@@ -979,23 +979,51 @@ def initialize_model_parallel(
         os.environ["UCX_NET_DEVICES"] = "all"
         os.environ["UCC_CL_BASIC_TLS"] = "^sharp,nccl"
 
+    pp_use_mooncake = int(os.environ.get("PP_USE_MOONCAKE", 0))
+    if pp_use_mooncake:
+        from mooncake import pg
+
+        host_ip = os.getenv('NODE_ADDR')
+        assert host_ip is not None
+        pg.set_host_ip(host_ip)
+
+        ib_hca = os.getenv('MCCL_IB_HCA', 'mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5')
+        hca_list = [item.strip() for item in ib_hca.split(',') if item.strip()]
+        pg.set_device_filter(hca_list)
+
+        world_size = torch.distributed.get_world_size()
+        local_rank_size = torch.musa.device_count()
+        local_rank = rank % local_rank_size
+
+        torch.musa.set_device(local_rank)
+
     for ranks in decoder_rank_generator.get_ranks('pp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            backend=pipeline_model_parallel_comm_backend,
-            pg_options=(
-                None
-                if pipeline_model_parallel_comm_backend == "ucc"
-                else get_nccl_options("pp", nccl_comm_cfgs)
-            ),
-            group_desc="PIPELINE_MODEL_PARALLEL_GROUP",
-        )
-        assert (
-            pipeline_model_parallel_comm_backend == None
-            or pipeline_model_parallel_comm_backend == "nccl"
-            or pipeline_model_parallel_comm_backend == "ucc"
-        ), f'"{pipeline_model_parallel_comm_backend}" backend for PP communication is currently not supported'
+        group = None
+        if pp_use_mooncake:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                backend='mooncake',
+                pg_options=pg.MooncakeBackendOptions(torch.ones((world_size,), dtype=torch.int32, device=f"musa:{local_rank}")),
+                group_desc="PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE",
+            )
+        else:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                backend=pipeline_model_parallel_comm_backend,
+                pg_options=(
+                    None
+                    if pipeline_model_parallel_comm_backend == "ucc"
+                    else get_nccl_options("pp", nccl_comm_cfgs)
+                ),
+                group_desc="PIPELINE_MODEL_PARALLEL_GROUP",
+            )
+            assert (
+                pipeline_model_parallel_comm_backend == None
+                or pipeline_model_parallel_comm_backend == "nccl"
+                or pipeline_model_parallel_comm_backend == "ucc"
+            ), f'"{pipeline_model_parallel_comm_backend}" backend for PP communication is currently not supported'
 
         if rank in ranks:
             if _PIPELINE_MODEL_PARALLEL_GROUP is None:
@@ -1288,7 +1316,6 @@ def get_pipeline_model_parallel_group(check_initialized=True):
             _PIPELINE_MODEL_PARALLEL_GROUP is not None
         ), "pipeline_model parallel group is not initialized"
     return _PIPELINE_MODEL_PARALLEL_GROUP
-
 
 def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False):
     """Get the data-parallel group the caller rank belongs to."""

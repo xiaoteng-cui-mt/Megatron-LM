@@ -1,11 +1,13 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 
+from megatron.core import parallel_state
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.utils import nvtx_decorator
 
@@ -363,6 +365,10 @@ class P2PCommunicator:
         if config.use_ring_exchange_p2p or config.batch_p2p_comm:
             reqs = []
         else:
+            reqs = {}
+
+        if int(os.environ.get("PP_USE_MOONCAKE", 0)) == 1:
+            p2p_func = _p2p_ops
             reqs = {}
 
         tensor_recv_prev = None
