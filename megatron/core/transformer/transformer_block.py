@@ -166,13 +166,18 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
         # Stage 1: [2, 3]  [6, 7]
         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
-        assert (
-            num_layers_per_pipeline_rank % vp_size == 0
-        ), f"num_layers_per_pipeline_rank {num_layers_per_pipeline_rank} \
-            should be divisible by vp_size {vp_size}"
-        num_layers_per_virtual_stage = num_layers_per_pipeline_rank // vp_size
-
-        num_layers_to_build = num_layers_per_virtual_stage
+        try:
+            assert (
+                num_layers_per_pipeline_rank % vp_size == 0
+            ), f"num_layers_per_pipeline_rank {num_layers_per_pipeline_rank} \
+                should be divisible by vp_size {vp_size}"
+            num_layers_per_virtual_stage = num_layers_per_pipeline_rank // vp_size
+            num_layers_to_build = num_layers_per_virtual_stage
+        except AssertionError:
+            if vp_stage == 0:
+                num_layers_to_build = num_layers_per_pipeline_rank
+            else:
+                num_layers_to_build = 0
 
     else:
         # Non-interleaved pipeline parallelism:

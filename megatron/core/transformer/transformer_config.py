@@ -1036,17 +1036,27 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError("num_layers_in_last_pipeline_stage must be larger than 0")
 
                 if self.virtual_pipeline_model_parallel_size is not None:
-                    if (
-                        self.num_layers_in_last_pipeline_stage
-                        % self.virtual_pipeline_model_parallel_size
-                        != 0
-                    ):
-                        raise ValueError(
-                            f"number of layers at last stage: "
-                            f"{self.num_layers_in_last_pipeline_stage}"
-                            f"must be divisible by virtual pipeline"
-                            f"parallel degree {self.virtual_pipeline_model_parallel_size}"
-                        )
+                    try:
+                        if (
+                            self.num_layers_in_last_pipeline_stage
+                            % self.virtual_pipeline_model_parallel_size
+                            != 0
+                        ):
+                            raise ValueError(
+                                f"number of layers at last stage: "
+                                f"{self.num_layers_in_last_pipeline_stage}"
+                                f"must be divisible by virtual pipeline"
+                                f"parallel degree {self.virtual_pipeline_model_parallel_size}"
+                            )
+                    except ValueError:
+                        if self.num_layers_in_last_pipeline_stage != 1:
+                            raise ValueError(
+                                f"number of layers at last stage: "
+                                f"{self.num_layers_in_last_pipeline_stage}"
+                                f"must be divisible by virtual pipeline"
+                                f"parallel degree {self.virtual_pipeline_model_parallel_size}"
+                            )
+
                 num_layers -= self.num_layers_in_last_pipeline_stage
                 pipeline_parallel_size -= 1
 

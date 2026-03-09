@@ -108,7 +108,9 @@ def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[i
                     if config.num_layers_in_last_pipeline_stage is None
                     else config.num_layers_in_last_pipeline_stage // vp_size
                 )
-
+                if config.num_layers_in_last_pipeline_stage == 1:
+                    num_layers_per_virtual_model_chunk_in_last_pipeline_stage = 1 
+                    
                 num_layers_per_vritual_model_chunk_in_middle_pipeline_stage = (
                     middle_num_layers // vp_size
                 )
