@@ -16,6 +16,7 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.transformer.multi_token_prediction import get_mtp_num_layers_to_build
 
+from transformer_engine.pytorch.cpu_offload import get_fine_grained_offload_handler
 
 class ModelChunkState:
     """State shared across a model chunk.
@@ -170,7 +171,10 @@ class TransformerLayerSchedulePlan:
         )
 
     @staticmethod
-    def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False):
+    def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False,
+            f_microbatch_id_layer_id=None,
+            b_microbatch_id_layer_id=None,
+        ):
         """Schedule one-forward-one-backward operations for a single transformer layer.
 
         This function interleaves forward and backward operations, overlapping the communications
@@ -194,40 +198,77 @@ class TransformerLayerSchedulePlan:
         Returns:
             Functions or values for next iteration's computation
         """
-
+        ce_event = torch.cuda.Event()
+        
+        from transformer_engine.pytorch.cpu_offload import get_fine_grained_offload_handler
+        from megatron.core.pipeline_parallel.utils import get_comm_stream
+        a2a_stream = get_comm_stream()
+        d2h_h2d_stream = get_fine_grained_offload_handler().d2h_stream
+        if d2h_h2d_stream is None:
+            get_fine_grained_offload_handler().d2h_stream = torch.cuda.Stream()
+            get_fine_grained_offload_handler().h2d_stream = get_fine_grained_offload_handler().d2h_stream
+            d2h_h2d_stream = get_fine_grained_offload_handler().d2h_stream
+        
+        
         if b_layer is not None:
+            a2a_stream.wait_event(ce_event)
             b_grad = b_layer.mtp_post_process.backward(b_grad)
-            b_grad = b_layer.moe_combine.backward(b_grad)
-
+            with torch.cuda.stream(a2a_stream):
+                b_grad = b_layer.moe_combine.backward(b_grad)
+                ce_event.record(a2a_stream)
+            
+        
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.attn.forward(f_input)
                 f_input = f_layer.post_attn.forward(f_input)
-
-        if b_layer is not None:
-            b_grad = b_layer.mlp.backward(b_grad)
-
+                
+        
         if f_layer is not None:
+            a2a_stream.wait_event(ce_event)
             with f_layer.get_fp8_context():
-                f_input = f_layer.moe_dispatch.forward(f_input)
-
+                with torch.cuda.stream(a2a_stream):
+                    f_input = f_layer.moe_dispatch.forward(f_input)
+                    ce_event.record(a2a_stream)
+                
+        
+        if b_layer is not None:
+            d2h_h2d_stream.wait_event(ce_event)
+            get_fine_grained_offload_handler().start_microbatch_backward(b_microbatch_id_layer_id[0], current_layer_id = b_microbatch_id_layer_id[1])
+            b_grad = b_layer.mlp.backward(b_grad)
+            ce_event.record(d2h_h2d_stream)
+                
+        
+        if f_layer is not None:
+            d2h_h2d_stream.wait_event(ce_event)
+            with f_layer.get_fp8_context():
+                get_fine_grained_offload_handler().start_microbatch_forward(f_microbatch_id_layer_id[0], current_layer_id = f_microbatch_id_layer_id[1])
+                f_input = f_layer.mlp.forward(f_input)
+            ce_event.record(d2h_h2d_stream)
+                
+        
         if b_layer is not None:
             b_layer.mlp.backward_dw()
-            b_grad = b_layer.moe_dispatch.backward(b_grad)
-
-        if f_layer is not None:
-            with f_layer.get_fp8_context():
-                f_input = f_layer.mlp.forward(f_input)
-
-        if f_layer is not None:
-            with f_layer.get_fp8_context():
-                f_input = f_layer.moe_combine.forward(f_input)
-                f_input = f_layer.mtp_post_process.forward(f_input)
-
+            a2a_stream.wait_event(ce_event)
+            with torch.cuda.stream(a2a_stream):
+                b_grad = b_layer.moe_dispatch.backward(b_grad)
+                ce_event.record(a2a_stream)
+                
+        
         if b_layer is not None:
             b_grad = b_layer.post_attn.backward(b_grad)
             b_grad = b_layer.attn.backward(b_grad)
-
+                
+        
+        if f_layer is not None:
+            a2a_stream.wait_event(ce_event)
+            with f_layer.get_fp8_context():
+                with torch.cuda.stream(a2a_stream):
+                    f_input = f_layer.moe_combine.forward(f_input)
+                    ce_event.record(a2a_stream)
+                f_input = f_layer.mtp_post_process.forward(f_input)
+            
+                        
         # Delay the last attn_dw in backward pass (attn_dw of the first layer)
         # for overlapping with the p2p comm
         if b_layer is not None and not is_last_layer_in_bwd:
@@ -391,6 +432,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         pre_backward=None,
         post_forward=None,
         post_backward=None,
+        f_microbatch_id_layer_id=None,
+        b_microbatch_id_layer_id=None,
     ):
         """Model Chunk level 1f1b fine-grained scheduler.
 
@@ -426,6 +469,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 pre_forward(f_schedule_plan.vp_stage)
             f_schedule_plan.record_current_stream()
             f_input = f_schedule_plan.pre_process.forward()
+            f_microbatch_id, f_layer_id = f_microbatch_id_layer_id
 
         if b_schedule_plan:
             b_schedule_plan.record_current_stream()
@@ -436,11 +480,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
             if b_schedule_plan.post_process is not None:
                 b_grad = b_schedule_plan.post_process.backward(b_grad)
+            b_microbatch_id, b_layer_id = b_microbatch_id_layer_id
 
         f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
         b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
         overlapped_layers = min(f_num_layers, b_num_layers)
-
         # combined forward and backward pass for overlapped layers
         for i in range(overlapped_layers):
             f_layer = f_schedule_plan.get_layer(i)
@@ -452,7 +496,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 f_input=f_input,
                 b_grad=b_grad,
                 is_last_layer_in_bwd=(i == b_num_layers - 1),
+                f_microbatch_id_layer_id=(f_microbatch_id, f_layer_id),
+                b_microbatch_id_layer_id=(b_microbatch_id, b_layer_id),
             )
+            f_layer_id += 1
+            b_layer_id -= 1
             torch.cuda.nvtx.range_pop()
 
         # backward pass for the remaining layers
@@ -460,15 +508,26 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
             torch.cuda.nvtx.range_push(f"layer_{b_num_layers - 1 - i}b")
             _, b_grad = TransformerLayerSchedulePlan.run(
-                None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
+                None, 
+                b_layer, 
+                b_grad=b_grad, 
+                is_last_layer_in_bwd=(i == b_num_layers - 1),
+                b_microbatch_id_layer_id=(b_microbatch_id, b_layer_id),
             )
+            b_layer_id -= 1
             torch.cuda.nvtx.range_pop()
 
         # forward pass for the remaining layers
         for i in range(overlapped_layers, f_num_layers):
             f_layer = f_schedule_plan.get_layer(i)
             torch.cuda.nvtx.range_push(f"layer_{i}f")
-            f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
+            f_input, _ = TransformerLayerSchedulePlan.run(
+                f_layer, 
+                None, 
+                f_input=f_input,
+                f_microbatch_id_layer_id=(f_microbatch_id, f_layer_id),
+            )
+            f_layer_id += 1
             torch.cuda.nvtx.range_pop()
 
         if f_schedule_plan is not None and post_forward is not None:
