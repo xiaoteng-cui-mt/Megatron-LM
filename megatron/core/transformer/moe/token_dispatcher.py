@@ -511,7 +511,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 _expert_quantile = (_token_per_expert / _token_per_expert.mean()).quantile(_q.to(_token_per_expert.device))
                 _device_quantile = (_token_per_device / _token_per_device.mean()).quantile(_q.to(_token_per_device.device))
                 self._extra_info = {"expert_quantile": _expert_quantile, "device_quantile": _device_quantile}
-                from mem_utils import MemMonitor
+                from musa_patch.mem_utils import MemMonitor
                 MemMonitor.max_rank_ratio_list.append(_device_quantile[-1])
 
 
@@ -1304,7 +1304,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             _expert_quantile = (_token_per_expert / _token_per_expert.mean()).quantile(_q.to(_token_per_expert.device))
             _device_quantile = (_token_per_device / _token_per_device.mean()).quantile(_q.to(_token_per_device.device))
             self._extra_info = {"expert_quantile": _expert_quantile, "device_quantile": _device_quantile}
-            from mem_utils import MemMonitor
+            from musa_patch.mem_utils import MemMonitor
             MemMonitor.max_rank_ratio_list.append(_device_quantile[-1])
 
         return global_input_tokens, tokens_per_expert, permuted_probs

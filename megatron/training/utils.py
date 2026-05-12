@@ -268,7 +268,7 @@ def report_memory(name):
     string += ' | max allocated: {}'.format(int(torch.cuda.max_memory_allocated() / mega_bytes))
     string += ' | reserved: {}'.format(torch.cuda.memory_reserved() / mega_bytes)
     string += ' | max reserved: {}'.format(torch.cuda.max_memory_reserved() / mega_bytes)
-    from mem_utils import get_max_gpu0_to_7_mem_usage, MemMonitor
+    from musa_patch.mem_utils import get_max_gpu0_to_7_mem_usage, MemMonitor
     max_idx, max_usage = get_max_gpu0_to_7_mem_usage()
     string += ' | max gmi memory usage: {}'.format(max_usage)
     string += ' | max gmi GPU local ID: {}'.format(max_idx)
