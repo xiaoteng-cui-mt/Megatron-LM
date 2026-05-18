@@ -310,15 +310,17 @@ class MultiLatentAttention(Attention):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
 
-        if self.recompute_up_proj:
-            assert self.qkv_up_checkpoint is not None
-            self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
-            self.qkv_up_checkpoint = None
-
         # =================
         # Output. [sq, b, h]
         # =================
         output, bias = self.linear_proj(core_attn_out)
+        if self.recompute_up_proj:
+            assert self.qkv_up_checkpoint is not None
+            # If core attention is also recomputed, q/k/v must be restored before core_attn_out.
+            self.qkv_up_checkpoint.discard_output_and_register_recompute(output)
+            self.qkv_up_checkpoint = None
+        if self.checkpoint_core_attention and self.training:
+            self._discard_core_attention_output(output)
 
         return output, bias
 
