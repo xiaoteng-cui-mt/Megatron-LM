@@ -1037,8 +1037,17 @@ class TransformerConfig(ModelParallelConfig):
                 pipeline_parallel_size -= 1
 
             if self.num_layers_in_last_pipeline_stage is not None:
-                if self.num_layers_in_last_pipeline_stage <= 0:
-                    raise ValueError("num_layers_in_last_pipeline_stage must be larger than 0")
+                if self.num_layers_in_last_pipeline_stage < 0:
+                    raise ValueError("num_layers_in_last_pipeline_stage must be non-negative")
+                if self.num_layers_in_last_pipeline_stage == 0:
+                    if self.mtp_num_layers != 1:
+                        raise ValueError(
+                            "num_layers_in_last_pipeline_stage can be 0 only when mtp_num_layers is 1"
+                        )
+                    if self.virtual_pipeline_model_parallel_size is not None:
+                        raise ValueError(
+                            "num_layers_in_last_pipeline_stage=0 with MTP is only supported when virtual pipeline parallelism is disabled"
+                        )
 
                 if self.virtual_pipeline_model_parallel_size is not None:
                     try:
