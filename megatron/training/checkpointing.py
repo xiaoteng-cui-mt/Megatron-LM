@@ -70,6 +70,7 @@ _CHECKPOINT_VERSION = None
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
 
+
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
     if _CHECKPOINT_VERSION is not None:
@@ -1542,6 +1543,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             gen_sd_optim = None
             gen_sd_opt_param_scheduler = None
 
+        if getattr(args, 'ckpt_load_use_cpu_staging', False):
+            sharded_sd_metadata = dict(sharded_sd_metadata or {})
+            sharded_sd_metadata['load_use_cpu_staging'] = True
+
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)
 
@@ -1843,6 +1848,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     # collect freed references to state_dict['model'] and state_dict['optimizer'] so CUDA can let go of the memory
     gc.collect()
     torch.cuda.empty_cache()
+    if getattr(args, 'ckpt_load_use_cpu_staging', False):
+        import torch_musa
+        torch_musa._MUSAC._host_emptyCache()
 
     if iteration > 0:
         # Notify FT that a checkpoint was loaded.

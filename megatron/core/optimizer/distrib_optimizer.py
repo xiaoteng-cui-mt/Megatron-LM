@@ -700,6 +700,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             list.
         """
         if self.ddp_config.use_megatron_fsdp:
+            state_dict.pop('load_use_cpu_staging', None)
             if "param_to_group_meta" in state_dict:
                 state_dict["param_groups"] = self._param2group_meta_to_param_groups(
                     state_dict["param_to_group_meta"], self.optimizer.param_groups
@@ -708,6 +709,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.load_state_dict(state_dict)
             return
 
+        load_use_cpu_staging = bool(state_dict.pop('load_use_cpu_staging', False))
         if len(self.optimizer.state) == 0:
             if isinstance(self.optimizer, HybridDeviceOptimizer):
                 self.optimizer.dummy_step()
@@ -770,8 +772,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                             # Allocate dummy tensors.
                             numel = len(param_range_map["gbuf_world"])
+                            init_device = (
+                                torch.device("cpu")
+                                if load_use_cpu_staging
+                                else torch.cuda.current_device()
+                            )
                             init_shard = lambda dtype=torch.float32: torch.empty(
-                                (numel,), dtype=dtype, device=torch.cuda.current_device()
+                                (numel,), dtype=dtype, device=init_device
                             )
 
                             # For precision_aware_optimizer, the empty tensors should also be
@@ -880,6 +887,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             optim_state = self.optimizer.state[main_param]
             tensors = {"param": main_param, **optim_state}
         return tensors
+
+    def _get_cpu_load_staging_main_param_and_optimizer_states(self, model_param, item_slice):
+        """Return CPU tensors used only as distributed checkpoint load staging buffers."""
+        assert item_slice is not None, "CPU checkpoint staging expects a DP-local flattened slice."
+        numel = item_slice.stop - item_slice.start
+
+        group_index, group_order = self.model_param_group_index_map[model_param]
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            # Precision-aware FusedAdam stores scaled/compressed states internally, but checkpoint
+            # save/load uses the unscaled FP32 view. Keep the temporary DCP target in that format.
+            dtype = torch.float32
+            return {
+                "param": torch.empty((numel,), dtype=dtype, device="cpu"),
+                "exp_avg": torch.empty((numel,), dtype=dtype, device="cpu"),
+                "exp_avg_sq": torch.empty((numel,), dtype=dtype, device="cpu"),
+            }
+
+        main_param = self.optimizer.param_groups[group_index]["params"][group_order]
+        return {
+            "param": torch.empty((numel,), dtype=main_param.dtype, device="cpu"),
+            "exp_avg": torch.empty((numel,), dtype=self.config.exp_avg_dtype, device="cpu"),
+            "exp_avg_sq": torch.empty((numel,), dtype=self.config.exp_avg_sq_dtype, device="cpu"),
+        }
 
     def _set_main_param_and_optimizer_states(self, model_param, tensors):
         """Set the main param and optimizer states corresponding to the input model_param.
@@ -1171,11 +1201,28 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for k, v in state_dict.items()
             }
 
-        if is_loading:
+        load_use_cpu_staging = (
+            is_loading
+            and sharding_type == 'fully_sharded_model_space'
+            and (metadata or {}).get('load_use_cpu_staging', False)
+        )
+        if load_use_cpu_staging and isinstance(self.optimizer, HybridDeviceOptimizer):
+            logger.warning(
+                'Ignoring checkpoint CPU staging for HybridDeviceOptimizer because it already '
+                'manages CPU/GPU optimizer state placement.'
+            )
+            load_use_cpu_staging = False
+
+        if is_loading and not load_use_cpu_staging:
             # Call the distributed optimizer's specialized load_state_dict(),
             # which conditionally skips re-allocating the optimizer's state if
             # already initialized, which in turn reduces memory fragmentation.
             self.load_state_dict(self.state_dict())
+        elif load_use_cpu_staging:
+            logger.info(
+                'Using CPU staging tensors for torch_dist distributed optimizer checkpoint load.'
+            )
+            state_dict['load_use_cpu_staging'] = LocalNonpersistentObject(True)
         if sharding_type == 'fully_sharded_bucket_space':
             param_state = self.sharded_param_state_fs_bucket_space(
                 model_sharded_state_dict, is_loading
@@ -1185,7 +1232,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             param_state = self.sharded_param_state_dp_zero(model_sharded_state_dict, is_loading)
         elif sharding_type == 'fully_sharded_model_space':
             param_state = self.sharded_param_state_fs_model_space(
-                model_sharded_state_dict, is_loading
+                model_sharded_state_dict, is_loading, load_use_cpu_staging
             )
         else:
             raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
@@ -1415,7 +1462,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return state
 
     def sharded_param_state_fs_model_space(
-        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+        self,
+        model_sharded_state_dict: ShardedStateDict,
+        is_loading: bool = False,
+        load_use_cpu_staging: bool = False,
     ):
         """Sharded state dict where each buffer is mapped to corresponding model param.
 
@@ -1438,7 +1488,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # `sharded_param_state_fs_model_space`.
         def _get_param_state_sharded_tensors(model_param, item_slice):
             # Main param & optimizer states.
-            tensors = self._get_main_param_and_optimizer_states(model_param)
+            if load_use_cpu_staging:
+                tensors = self._get_cpu_load_staging_main_param_and_optimizer_states(
+                    model_param, item_slice
+                )
+            else:
+                tensors = self._get_main_param_and_optimizer_states(model_param)
             tensors["fp32_param"] = tensors.pop("param")
 
             # Match optimizer parameter with model ShardedTensor (or

@@ -199,13 +199,14 @@ class MLP(MegatronModule):
     ) -> ShardedStateDict:
         sharded_state_dict = {}
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        load_use_cpu_staging = (metadata or {}).get('load_use_cpu_staging', False)
         for name, module in self._modules.items():
             sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
                     if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
                         sub_sd[k] = apply_swiglu_sharded_factory(
-                            v, sharded_offsets, singleton_local_shards
+                            v, sharded_offsets, singleton_local_shards, load_use_cpu_staging
                         )
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
@@ -217,7 +218,10 @@ class MLP(MegatronModule):
 
 # pylint: disable=missing-function-docstring
 def apply_swiglu_sharded_factory(
-    original_sh_ten, sharded_offsets, singleton_local_shards: bool = False
+    original_sh_ten,
+    sharded_offsets,
+    singleton_local_shards: bool = False,
+    load_use_cpu_staging: bool = False,
 ):
     # We must split the tensor into 2 parts, each sharded separately.
     # This requires a ShardedTensorFactory which `chunk`s during saving
@@ -339,7 +343,15 @@ def apply_swiglu_sharded_factory(
             return result
 
     def sh_ten_merge_fn(sub_state_dict):
+        def cpu_merge():
+            merged_sub_state_dict = torch.cat([t.detach().cpu() for t in sub_state_dict])
+            gc.collect()
+            torch.cuda.empty_cache()
+            return merged_sub_state_dict
+
         with torch.no_grad():
+            if load_use_cpu_staging:
+                return cpu_merge()
             try:
                 return torch.cat(sub_state_dict)
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
@@ -347,10 +359,7 @@ def apply_swiglu_sharded_factory(
                     f"CUDA OutOfMemoryError encountered during tensors merging."
                     f" Switching to CPU merge. (Error: {e})"
                 )
-                merged_sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict])
-                gc.collect()
-                torch.cuda.empty_cache()
-                return merged_sub_state_dict
+                return cpu_merge()
 
     return ShardedTensorFactory(
         original_sh_ten.key,

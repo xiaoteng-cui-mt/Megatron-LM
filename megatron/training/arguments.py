@@ -2256,6 +2256,11 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-load', action='store_true',
                        help='Apply full load parallelization across DP for'
                             ' distributed checkpoints.')
+    group.add_argument('--ckpt-load-use-cpu-staging', action='store_true',
+                       help='During torch_dist checkpoint load, keep selected temporary'
+                            ' DCP/factory/optimizer staging tensors on CPU to reduce'
+                            ' peak GPU memory. Final model and optimizer tensors remain'
+                            ' on their training devices.')
     group.add_argument('--ckpt-assume-constant-structure', action='store_true',
                        help='If the model and optimizer state dict structure is'
                             'constant throughout a *single training job*, it allows for'
