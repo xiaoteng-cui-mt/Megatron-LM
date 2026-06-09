@@ -253,10 +253,8 @@ class TELinear(te.pytorch.Linear):
         extra_kwargs = _get_extra_te_kwargs(config)
 
         if self.config.delay_wgrad_compute:
-            if is_te_min_version("2.3.0"):
-                extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
-            else:
-                raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
+            extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
+
         if (
             self.config.tp_comm_overlap
             and tp_comm_buffer_name
@@ -463,10 +461,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.tp_rank = get_pg_rank(tp_group)
 
         if self.config.delay_wgrad_compute:
-            if is_te_min_version("2.3.0"):
-                extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
-            else:
-                raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
+            extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
 
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
         if is_te_min_version("0.11.0"):
@@ -1051,12 +1046,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             extra_kwargs = _get_extra_te_kwargs(config)
 
             if self.config.delay_wgrad_compute:
-                if is_te_min_version("2.3.0"):
-                    extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
-                else:
-                    raise RuntimeError(
-                        "Only TE with version >=2.3.0 supports delay_wgrad_compute now."
-                    )
+                extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
 
             extra_kwargs["ub_name"] = tp_comm_buffer_name
 

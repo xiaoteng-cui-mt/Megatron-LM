@@ -58,16 +58,12 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         raise Exception('{} dataloader type is not supported.'.format(
                 args.dataloader_type))
 
-    multiprocessing_context='spawn' if int(os.environ.get("PP_USE_MOONCAKE", 0)) == 1 else None
-
     # Torch dataloader.
     return torch.utils.data.DataLoader(dataset,
                                        batch_sampler=batch_sampler,
                                        num_workers=args.num_workers,
                                        pin_memory=True,
-                                       persistent_workers=True if args.num_workers > 0 else False,
-                                       multiprocessing_context=multiprocessing_context,
-                                       )
+                                       persistent_workers=True if args.num_workers > 0 else False)
 
 class MegatronPretrainingSampler:
 

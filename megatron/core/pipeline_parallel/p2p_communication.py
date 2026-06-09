@@ -358,7 +358,13 @@ class P2PCommunicator:
         else:
             p2p_func = _p2p_ops
 
-        pp_group = self.pp_group
+        if int(os.environ.get("PP_USE_MOONCAKE", 0)) == 1:
+            pp_group = parallel_state.get_pipeline_model_parallel_group_mooncake(check_initialized=False)
+            if pp_group is None:
+                parallel_state.initialize_mooncake_pp_group()
+                pp_group = parallel_state.get_pipeline_model_parallel_group_mooncake()
+        else:
+            pp_group = self.pp_group
         next_rank = self.next_rank
         prev_rank = self.prev_rank
 

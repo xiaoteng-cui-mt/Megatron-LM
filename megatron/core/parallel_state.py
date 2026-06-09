@@ -23,6 +23,7 @@ except ImportError:
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
+_PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
 _MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra-, pipeline, and expert) that the current rank belongs to.
@@ -126,6 +127,8 @@ _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
+
+_DECODER_RANK_GENERATOR = None
 
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
@@ -683,6 +686,8 @@ def initialize_model_parallel(
     for pg_name in high_priority_stream_groups:
         overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ("is_high_priority_stream", True))
 
+    global _DECODER_RANK_GENERATOR
+
     decoder_rank_generator = RankGenerator(
         tp=tensor_model_parallel_size,
         ep=1,
@@ -692,6 +697,8 @@ def initialize_model_parallel(
         order=order,
         rank_offset=0,
     )
+
+    _DECODER_RANK_GENERATOR = decoder_rank_generator
 
     # Build expert rank generator
     if expert_tensor_parallel_size is None:
@@ -917,6 +924,7 @@ def initialize_model_parallel(
     # Build the pipeline model-parallel groups and embedding groups
     # (first and last rank in each pipeline model-parallel group).
     global _PIPELINE_MODEL_PARALLEL_GROUP
+    global _PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE
     global _PIPELINE_GLOBAL_RANKS
     assert (
         _PIPELINE_MODEL_PARALLEL_GROUP is None
@@ -979,51 +987,23 @@ def initialize_model_parallel(
         os.environ["UCX_NET_DEVICES"] = "all"
         os.environ["UCC_CL_BASIC_TLS"] = "^sharp,nccl"
 
-    pp_use_mooncake = int(os.environ.get("PP_USE_MOONCAKE", 0))
-    if pp_use_mooncake:
-        from mooncake import pg
-
-        host_ip = os.getenv('NODE_ADDR')
-        assert host_ip is not None
-        pg.set_host_ip(host_ip)
-
-        ib_hca = os.getenv('MCCL_IB_HCA', 'mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5')
-        hca_list = [item.strip() for item in ib_hca.split(',') if item.strip()]
-        pg.set_device_filter(hca_list)
-
-        world_size = torch.distributed.get_world_size()
-        local_rank_size = torch.musa.device_count()
-        local_rank = rank % local_rank_size
-
-        torch.musa.set_device(local_rank)
-
     for ranks in decoder_rank_generator.get_ranks('pp'):
-        group = None
-        if pp_use_mooncake:
-            group = create_group(
-                ranks,
-                timeout=timeout,
-                backend='mooncake',
-                pg_options=pg.MooncakeBackendOptions(torch.ones((world_size,), dtype=torch.int32, device=f"musa:{local_rank}")),
-                group_desc="PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE",
-            )
-        else:
-            group = create_group(
-                ranks,
-                timeout=timeout,
-                backend=pipeline_model_parallel_comm_backend,
-                pg_options=(
-                    None
-                    if pipeline_model_parallel_comm_backend == "ucc"
-                    else get_nccl_options("pp", nccl_comm_cfgs)
-                ),
-                group_desc="PIPELINE_MODEL_PARALLEL_GROUP",
-            )
-            assert (
-                pipeline_model_parallel_comm_backend == None
-                or pipeline_model_parallel_comm_backend == "nccl"
-                or pipeline_model_parallel_comm_backend == "ucc"
-            ), f'"{pipeline_model_parallel_comm_backend}" backend for PP communication is currently not supported'
+        group = create_group(
+            ranks,
+            timeout=timeout,
+            backend=pipeline_model_parallel_comm_backend,
+            pg_options=(
+                None
+                if pipeline_model_parallel_comm_backend == "ucc"
+                else get_nccl_options("pp", nccl_comm_cfgs)
+            ),
+            group_desc="PIPELINE_MODEL_PARALLEL_GROUP",
+        )
+        assert (
+            pipeline_model_parallel_comm_backend == None
+            or pipeline_model_parallel_comm_backend == "nccl"
+            or pipeline_model_parallel_comm_backend == "ucc"
+        ), f'"{pipeline_model_parallel_comm_backend}" backend for PP communication is currently not supported'
 
         if rank in ranks:
             if _PIPELINE_MODEL_PARALLEL_GROUP is None:
@@ -1267,6 +1247,64 @@ def initialize_model_parallel(
     _set_global_memory_buffer()
 
 
+def initialize_mooncake_pp_group():
+    global _DECODER_RANK_GENERATOR
+    global _PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE
+
+    from mooncake import pg
+
+    host_ip = os.getenv('NODE_ADDR')
+    assert host_ip is not None
+    pg.set_host_ip(host_ip)
+
+    world_size = torch.distributed.get_world_size()
+    local_rank_size = torch.musa.device_count()
+    rank = torch.distributed.get_rank()
+    local_rank = rank % local_rank_size
+
+    ib_hca = os.getenv('MCCL_IB_HCA', 'mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5')
+    hca_list = [item.strip() for item in ib_hca.split(',') if item.strip()]
+
+    if os.getenv('MC_BIND_NIC_ZJ_ENV', '0') == '1':
+        if local_rank == 0 or local_rank == 1:
+            hca_list = ['mlx5_bond_2']
+        elif local_rank == 2 or local_rank == 3:
+            hca_list = ['mlx5_bond_3']
+        elif local_rank == 4 or local_rank == 5:
+            hca_list = ['mlx5_bond_4']
+        else:
+            hca_list = ['mlx5_bond_5']
+
+    pg.set_device_filter(hca_list)
+
+    torch.musa.set_device(local_rank)
+
+    distributed_timeout_minutes = 30
+    timeout = timedelta(minutes=distributed_timeout_minutes)
+
+    pipe_line_global_ranks = None
+
+    for ranks in _DECODER_RANK_GENERATOR.get_ranks('pp'):
+        mooncake_group = create_group(
+            ranks,
+            timeout=timeout,
+            backend='mooncake',
+            pg_options=pg.MooncakeBackendOptions(torch.ones((world_size,), dtype=torch.int32, device=f"musa:{local_rank}")),
+            group_desc="PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE",
+        )
+
+        if rank in ranks:
+            if _PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE is None:
+                _PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE = mooncake_group
+                pipe_line_global_ranks = ranks
+            elif isinstance(pipe_line_global_ranks[0], list):
+                pipe_line_global_ranks.append(ranks)
+                _PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE.append(mooncake_group)
+            else:
+                pipe_line_global_ranks = [pipe_line_global_ranks, ranks]
+                _PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE = [_PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE, mooncake_group]
+
+
 def is_initialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
     return _DATA_PARALLEL_GROUP is not None
@@ -1316,6 +1354,15 @@ def get_pipeline_model_parallel_group(check_initialized=True):
             _PIPELINE_MODEL_PARALLEL_GROUP is not None
         ), "pipeline_model parallel group is not initialized"
     return _PIPELINE_MODEL_PARALLEL_GROUP
+
+
+def get_pipeline_model_parallel_group_mooncake(check_initialized=True):
+    if check_initialized:
+        assert (
+            _PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE is not None
+        ), "pipeline_model parallel mooncake group is not initialized"
+    return _PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE
+
 
 def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False):
     """Get the data-parallel group the caller rank belongs to."""
@@ -1938,6 +1985,9 @@ def destroy_model_parallel():
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
+
+    global _PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE
+    _PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE = None
 
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
