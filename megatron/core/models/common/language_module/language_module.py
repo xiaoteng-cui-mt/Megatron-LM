@@ -62,6 +62,8 @@ class LanguageModule(MegatronModule):
         if torch.distributed.get_rank() in torch.distributed.get_process_group_ranks(
             self.embd_group
         ):
+            if getattr(self, 'mtp_process', False):
+                return True
             if (
                 torch.distributed.get_rank()
                 == torch.distributed.get_process_group_ranks(self.embd_group)[0]

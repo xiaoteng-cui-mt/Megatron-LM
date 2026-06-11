@@ -225,8 +225,8 @@ class GPTModel(LanguageModule):
                 tp_group=self.model_comm_pgs.tp,
             )
 
-        if self.pre_process or self.post_process:
-            self.setup_embeddings_and_output_layer()
+        if self.pre_process or self.post_process or self.mtp_process:
+            self.setup_embeddings_and_output_layer()  
 
         if has_config_logger_enabled(self.config):
             log_config_to_disk(
@@ -465,7 +465,9 @@ class GPTModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.mtp_process:
+        
+        # if self.mtp_process:
+        if self.config.mtp_num_layers is not None:
             mtp_labels = labels.clone()
             hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
             hidden_states = hidden_states_list[0]
@@ -680,15 +682,17 @@ class GPTModel(LanguageModule):
             emb_weight_key = f'{prefix}embedding.word_embeddings.weight'
             emb_weight = self.embedding.word_embeddings.weight
             tie_word_embeddings_state_dict(sharded_state_dict, emb_weight, emb_weight_key)
-        if self.mtp_process and not self.post_process:
-            # We only need to tie the output layer weight if share_embeddings_and_output_weights
-            # is False. Because if share_embeddings_and_output_weights is True, the shared weight
-            # will be stored in embedding layer, and output layer will not have any weight.
-            if not self.share_embeddings_and_output_weights:
-                output_layer_weight_key = f'{prefix}output_layer.weight'
-                output_layer_weight = self.output_layer.weight
-                tie_output_layer_state_dict(
-                    sharded_state_dict, output_layer_weight, output_layer_weight_key
-                )
+        
+        # MTP loss是在post_process阶段计算，所以在mtp_process 不需要output_layer的权重
+        # if self.mtp_process and not self.post_process:
+        #     # We only need to tie the output layer weight if share_embeddings_and_output_weights
+        #     # is False. Because if share_embeddings_and_output_weights is True, the shared weight
+        #     # will be stored in embedding layer, and output layer will not have any weight.
+        #     if not self.share_embeddings_and_output_weights:
+        #         output_layer_weight_key = f'{prefix}output_layer.weight'
+        #         output_layer_weight = self.output_layer.weight
+        #         tie_output_layer_state_dict(
+        #             sharded_state_dict, output_layer_weight, output_layer_weight_key
+        #         )
 
         return sharded_state_dict

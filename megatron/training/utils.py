@@ -486,7 +486,7 @@ def get_blend_and_blend_per_split(args):
     return blend, blend_per_split
 
 
-def get_batch_on_this_tp_rank(data_iterator):
+def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
     args = get_args()
 

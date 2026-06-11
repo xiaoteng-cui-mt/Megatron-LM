@@ -545,7 +545,7 @@ def get_gpt_mtp_block_spec_for_backend(
     mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
     mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
 
-    offset = get_mtp_layer_offset(config)
+    offset = get_mtp_layer_offset(config, vp_stage=vp_stage)
     # split the mtp layer specs to only include the layers that are built in this pipeline stage.
     mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
     if len(mtp_layer_specs) > 0:
