@@ -178,6 +178,7 @@ class Attention(MegatronModule, ABC):
             self.config.recompute_granularity == 'selective'
             and "core_attn" in self.config.recompute_modules
         )
+        self.core_attention_checkpoint = None
 
         # Output.
         self.linear_proj = build_module(
@@ -241,11 +242,20 @@ class Attention(MegatronModule, ABC):
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
-        hidden_states = tensor_parallel.checkpoint(
-            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
+        self.core_attention_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+            fp8=self.config.fp8
+        )
+        hidden_states = self.core_attention_checkpoint.checkpoint(
+            custom_forward, query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
         )
 
         return hidden_states
+
+    def _discard_core_attention_output(self, hook_tensor):
+        """Discard checkpointed core attention output after the output projection saves it."""
+        if self.core_attention_checkpoint is not None:
+            self.core_attention_checkpoint.discard_output_and_register_recompute(hook_tensor)
+            self.core_attention_checkpoint = None
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
@@ -844,6 +854,8 @@ class Attention(MegatronModule, ABC):
 
         nvtx_range_push(suffix="linear_proj")
         output, bias = self.linear_proj(core_attn_out)
+        if self.checkpoint_core_attention and self.training:
+            self._discard_core_attention_output(output)
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias

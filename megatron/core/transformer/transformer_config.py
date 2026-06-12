@@ -312,8 +312,8 @@ class TransformerConfig(ModelParallelConfig):
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
-    "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "core_attn", "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
+    "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
     ####################
@@ -901,7 +901,8 @@ class TransformerConfig(ModelParallelConfig):
                 warnings.warn(
                     "If you are using transformer_engine as the transformer implementation, "
                     "the core_attn is from transformer_engine and may be the fused version. "
-                    "For fused attention, you have no need to set 'core_attn' to recompute. "
+                    "For fused attention, the main benefit of 'core_attn' recompute is "
+                    "discarding the core attention output saved by the output projection. "
                     "Please check that the core_attn recompute is really needed."
                 )
 
