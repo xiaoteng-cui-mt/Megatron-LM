@@ -99,6 +99,9 @@ class RerunState(Enum):
         the job was restarted from a checkpoint.
     - RERUNNING_AGAIN_FROM_CHECKPOINT
         State when the re-run from checkpoint was rescheduled on the same potentially faulty GPU.
+    - WILL_VERIFY_TRANSIENT_FROM_CHECKPOINT
+        State when first re-run has different result compared to original, second re-run will verify
+        whether the original failure was transient and potentially continue.
     """
 
     NOT_RUNNING_YET = 0
@@ -107,6 +110,7 @@ class RerunState(Enum):
     WILL_RERUN_FROM_CHECKPOINT = 3
     RERUNNING_FROM_CHECKPOINT = 4
     RERUNNING_AGAIN_FROM_CHECKPOINT = 5
+    WILL_VERIFY_TRANSIENT_FROM_CHECKPOINT = 6
 
 
 class RerunValidationStatus(str, Enum):
@@ -137,6 +141,8 @@ class RerunStateMachine:
         mode: operating mode for the rerun state machine, default is disabled.
         error_injector: optional result injection engine, default is no result injection.
         result_rejected_tracker_filename: optional name of file tracking `result rejected` events.
+        continue_on_transient_error: continue to train if previous checkpoint failed due to transient
+                    validation error. Notice: this flag does not work for first re-run.
 
     Example usage:
 
@@ -187,6 +193,7 @@ class RerunStateMachine:
         mode: RerunMode = RerunMode.DISABLED,
         error_injector: Optional["RerunErrorInjector"] = None,
         result_rejected_tracker_filename: Optional[str] = None,
+        continue_on_transient_error: bool = False,
     ) -> None:
         self.mode: RerunMode = mode
         self.state: RerunState = RerunState.NOT_RUNNING_YET
@@ -201,6 +208,7 @@ class RerunStateMachine:
         self.restart_again_requested: bool = False
         # Request to resume normal execution when no HW fault was detected.
         self.continue_requested: bool = False
+        self.continue_on_transient_error: bool = continue_on_transient_error
         self.logged_sdc_enabled: bool = False
 
         self.error_injector: RerunErrorInjector = error_injector or RerunErrorInjector()
@@ -330,19 +338,35 @@ class RerunStateMachine:
                 self._maybe_report_stats()
                 self.saved_results = defaultdict(list)
                 return False
+            will_continue_tensor: torch.Tensor = torch.tensor(
+                [self.continue_requested], dtype=torch.int32, device="cuda"
+            )
+            torch.distributed.all_reduce(will_continue_tensor)
+            if will_continue_tensor.item() > 0:
+                if _safe_get_rank() == 0:
+                    logger.warning(
+                        "Continuing normal execution because failed validation was not reproduced"
+                    )
+                self.state = RerunState.NOT_RUNNING_YET
+                return False
+
+            # checkpoint_requested is not a good name as both cases creating checkpoints
             will_checkpoint_tensor: torch.Tensor = torch.tensor(
                 [self.checkpoint_requested], dtype=torch.int32, device="cuda"
             )
             torch.distributed.all_reduce(will_checkpoint_tensor)
             if will_checkpoint_tensor.item() > 0:
                 self.state = RerunState.WILL_RERUN_FROM_CHECKPOINT
+            else:
+                self.state = RerunState.WILL_VERIFY_TRANSIENT_FROM_CHECKPOINT
             self._restore_state()
             if data_iterators:
                 for d in data_iterators:
                     d.rewind()
             return False
         # Are we about to re-run from a checkpoint?
-        elif self.state == RerunState.WILL_RERUN_FROM_CHECKPOINT:
+        elif self.state in [RerunState.WILL_RERUN_FROM_CHECKPOINT,
+                            RerunState.WILL_VERIFY_TRANSIENT_FROM_CHECKPOINT]:
             self.state = RerunState.RERUNNING_FROM_CHECKPOINT
             return True
         # Are we done re-running from a checkpoint?
@@ -402,7 +426,7 @@ class RerunStateMachine:
         self.first_iteration_complete = True
         if self.mode in [RerunMode.DISABLED, RerunMode.REPORT_DETERMINISM_STATS]:
             return False, False, 0
-        if self.state == RerunState.RERUNNING_IN_PLACE:
+        if self.state == RerunState.WILL_VERIFY_TRANSIENT_FROM_CHECKPOINT:
             if _safe_get_rank() == 0:
                 logger.warning(
                     "Exiting now. A checkpoint at the last iteration is being saved "
@@ -610,6 +634,23 @@ class RerunStateMachine:
                     )
             # This is the second re-run.
             elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
+                # Continue training if rerunning value is valid, overwrite fatal argument
+                if self.continue_on_transient_error:
+                    result_rejected: bool = rejection_func(result)
+                    if not result_rejected:
+                        self._log_validation_error_to_file(
+                            status=RerunValidationStatus.SECOND_RERUN_NOT_REPRODUCIBLE,
+                            result=result,
+                            message=message,
+                        )
+                        logger.warning(
+                            "Second rerun: failed validation is no longer reproduced after "
+                            "loading from checkpoint, therefore continuing normal execution "
+                            f"({result} != {self.initial_result})"
+                        )
+                        self.continue_requested = True
+                        return
+
                 # Ensure we're not on the same GPU as the first rerun.
                 node: str = os.uname()[1]
                 device: int = torch.cuda.current_device()
@@ -772,8 +813,12 @@ class RerunStateMachine:
             "suspicious_node": self.suspicious_node,
             "suspicious_device": self.suspicious_device,
             # No need to save saved_state (RNG state  already captured in checkpoint).
+            # Microbatch replay buffers can be large; checkpoint restore should rebuild
+            # dataloader position from training state rather than serializing them here.
             "data_iterator_checkpoints": (
-                [d.state_dict() for d in data_iterators] if data_iterators else None
+                [d.state_dict(include_saved_microbatches=False) for d in data_iterators]
+                if data_iterators
+                else None
             ),
             "large_value_counts": self.large_value_counts,
             "max_values": self.max_values,
@@ -1076,21 +1121,24 @@ class RerunDataIterator:
         self.replaying = False
         self.saved_microbatches = []
 
-    def state_dict(self) -> SerializableStateType:
+    def state_dict(self, include_saved_microbatches: bool = True) -> SerializableStateType:
         """Method to capture the state of the iterator as a serializable dict."""
 
-        return {
-            "saved_microbatches": self.saved_microbatches,
-            "replaying": self.replaying,
-            "replay_pos": self.replay_pos,
-        }
+        if include_saved_microbatches:
+            return {
+                "saved_microbatches": self.saved_microbatches,
+                "replaying": self.replaying,
+                "replay_pos": self.replay_pos,
+            }
+
+        return {"replaying": False, "replay_pos": 0}
 
     def load_state_dict(self, state_dict: SerializableStateType) -> None:
         """Method to restore the state saved as a serializable dict."""
 
-        self.saved_microbatches = state_dict["saved_microbatches"]
-        self.replaying = state_dict["replaying"]
-        self.replay_pos = state_dict["replay_pos"]
+        self.saved_microbatches = state_dict.get("saved_microbatches", [])
+        self.replaying = bool(self.saved_microbatches) and state_dict.get("replaying", False)
+        self.replay_pos = state_dict.get("replay_pos", 0) if self.replaying else 0
 
 
 class QuickStats:

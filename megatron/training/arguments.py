@@ -2054,6 +2054,8 @@ def _add_rerun_machine_args(parser):
                        help='Use re-run engine to validate results (default) '
                        'or to emit stats on variability of computations due to '
                        'non-deterministic algorithms.')
+    group.add_argument('--train-continue-on-transient-error', action='store_true',
+                       help='Continue training when a failed validation is not reproduced during rerun.')
 
     return parser
 
