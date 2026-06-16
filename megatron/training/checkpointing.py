@@ -691,6 +691,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
 
+    # collect freed references from state dict so CUDA/MUSA can let go of the memory
+    gc.collect()
+    torch.cuda.empty_cache()
+
 def cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=False):
     if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
         return
