@@ -29,7 +29,8 @@ class LayerType(enum.Enum):
     loss: loss layer
     encoder: encoder layer, not implemented yet, expect to be used in MLLM models
     decoder: decoder layer
-    mtp: multi-token prediction layer, not implemented yet
+    mtp: multi-token prediction layer
+    mtp_loss: multi-token prediction loss layer
     """
 
     embedding = 1
@@ -37,6 +38,7 @@ class LayerType(enum.Enum):
     encoder = 3
     decoder = 4
     mtp = 5
+    mtp_loss = 6
 
 
 class AttnType(enum.Enum):

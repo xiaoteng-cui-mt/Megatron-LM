@@ -20,11 +20,12 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.enums import LayerType, ModelType
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossAutoScaler,
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    mtp_loss_on_this_rank,
     roll_tensor,
     tie_output_layer_state_dict,
     tie_word_embeddings_state_dict,
@@ -137,6 +138,9 @@ class GPTModel(LanguageModule):
         self.rotary_scaling = rope_scaling
         self.mtp_block_spec = mtp_block_spec
         self.mtp_process = mtp_block_spec is not None
+        self.mtp_loss_process = mtp_loss_on_this_rank(
+            config, ignore_virtual=False, vp_stage=vp_stage
+        )
 
         if self.pre_process or self.mtp_process:
             self.embedding = LanguageModelEmbedding(
@@ -193,7 +197,7 @@ class GPTModel(LanguageModule):
             )
 
         # Output
-        if self.post_process:
+        if self.post_process or self.mtp_loss_process:
 
             if self.config.defer_embedding_wgrad_compute:
                 # The embedding activation buffer preserves a reference to the input activations
@@ -225,8 +229,8 @@ class GPTModel(LanguageModule):
                 tp_group=self.model_comm_pgs.tp,
             )
 
-        if self.pre_process or self.post_process or self.mtp_process:
-            self.setup_embeddings_and_output_layer()  
+        if self.pre_process or self.post_process or self.mtp_process or self.mtp_loss_process:
+            self.setup_embeddings_and_output_layer()
 
         if has_config_logger_enabled(self.config):
             log_config_to_disk(
@@ -412,6 +416,51 @@ class GPTModel(LanguageModule):
             inference_context=inference_context,
         )
 
+    def _compute_mtp_loss_and_forward_base_hidden(
+        self,
+        hidden_states,
+        labels,
+        loss_mask,
+        output_weight,
+        runtime_gather_output=None,
+    ):
+        """Compute MTP losses from concatenated hidden states and forward base hidden states."""
+        mtp_labels = labels.clone()
+        hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
+        hidden_states = hidden_states_list[0].clone()
+        if loss_mask is None:
+            # if loss_mask is not provided, use all ones as loss_mask
+            loss_mask = torch.ones_like(mtp_labels)
+        for mtp_layer_number in range(self.config.mtp_num_layers):
+            mtp_logits, _ = self.output_layer(
+                hidden_states_list[mtp_layer_number + 1],
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+            mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group)
+            loss_mask, num_tokens = roll_tensor(
+                loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group
+            )
+            mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
+            mtp_loss = loss_mask * mtp_loss
+            if self.training:
+                # TODO(shifangx): remove the use of parallel_state here
+                # after moving loss logging to loss_func in pretrain_gpt.py
+                MTPLossLoggingHelper.save_loss_to_tracker(
+                    torch.sum(mtp_loss) / num_tokens,
+                    mtp_layer_number,
+                    self.config.mtp_num_layers,
+                    avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                )
+            mtp_loss_scale = self.config.mtp_loss_scaling_factor / self.config.mtp_num_layers
+            if self.config.calculate_per_token_loss:
+                hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss)
+            else:
+                hidden_states = MTPLossAutoScaler.apply(
+                    hidden_states, mtp_loss_scale * mtp_loss / num_tokens
+                )
+        return hidden_states.clone()
+
     def _postprocess(
         self,
         hidden_states,
@@ -462,52 +511,28 @@ class GPTModel(LanguageModule):
                 **(extra_block_kwargs or {}),
             )
 
+        if self.config.mtp_num_layers is not None:
+            has_split_mtp_loss = (
+                self.config.pipeline_model_parallel_layout is not None
+                and LayerType.mtp_loss in self.config.pipeline_model_parallel_layout.flatten_layout
+            )
+            run_mtp_loss = self.mtp_loss_process or (self.post_process and not has_split_mtp_loss)
+        else:
+            run_mtp_loss = False
+        if run_mtp_loss:
+            hidden_states = self._compute_mtp_loss_and_forward_base_hidden(
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+
         if not self.post_process:
+            if getattr(hidden_states, "_base", None) is not None:
+                hidden_states = hidden_states.clone()
             return hidden_states
 
-        
-        # if self.mtp_process:
-        if self.config.mtp_num_layers is not None:
-            mtp_labels = labels.clone()
-            hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
-            hidden_states = hidden_states_list[0]
-            if loss_mask is None:
-                # if loss_mask is not provided, use all ones as loss_mask
-                loss_mask = torch.ones_like(mtp_labels)
-            for mtp_layer_number in range(self.config.mtp_num_layers):
-                # output
-                mtp_logits, _ = self.output_layer(
-                    hidden_states_list[mtp_layer_number + 1],
-                    weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
-                )
-                # Calc loss for the current Multi-Token Prediction (MTP) layers.
-                mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group)
-                loss_mask, num_tokens = roll_tensor(
-                    loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group
-                )
-                mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
-                mtp_loss = loss_mask * mtp_loss
-                if self.training:
-                    # TODO(shifangx): remove the use of parallel_state here
-                    # after moving loss logging to loss_func in pretrain_gpt.py
-                    MTPLossLoggingHelper.save_loss_to_tracker(
-                        torch.sum(mtp_loss) / num_tokens,
-                        mtp_layer_number,
-                        self.config.mtp_num_layers,
-                        avg_group=parallel_state.get_data_parallel_group(
-                            with_context_parallel=True
-                        ),
-                    )
-                mtp_loss_scale = self.config.mtp_loss_scaling_factor / self.config.mtp_num_layers
-                if self.config.calculate_per_token_loss:
-                    hidden_states = MTPLossAutoScaler.apply(
-                        hidden_states, mtp_loss_scale * mtp_loss
-                    )
-                else:
-                    hidden_states = MTPLossAutoScaler.apply(
-                        hidden_states, mtp_loss_scale * mtp_loss / num_tokens
-                    )
         sequence_parallel_override = False
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
@@ -574,15 +599,14 @@ class GPTModel(LanguageModule):
             Otherwise, during post processing it returns the final output layers weight.
         """
         if self.pre_process or self.mtp_process:
-            # Multi-Token Prediction (MTP) need both embedding layer and output layer.
-            # So there will be both embedding layer and output layer in the mtp process stage.
-            # In this case, if share_embeddings_and_output_weights is True, the shared weights
-            # will be stored in embedding layer, and output layer will not have any weight.
+            # Multi-Token Prediction (MTP) needs the input embeddings.
+            # If MTP is on a separate stage and sharing is enabled, the shared weights
+            # are stored in this embedding layer.
             assert hasattr(
                 self, 'embedding'
             ), f"embedding is needed in this pipeline stage, but it is not initialized."
             return self.embedding.word_embeddings.weight
-        elif self.post_process:
+        elif self.post_process or self.mtp_loss_process:
             return self.output_layer.weight
         return None
 
