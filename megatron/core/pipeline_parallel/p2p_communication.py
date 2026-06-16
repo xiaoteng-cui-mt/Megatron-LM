@@ -300,6 +300,14 @@ class P2PCommunicator:
         tensor_recv_prev_func = None
         tensor_recv_next_func = None
 
+        if int(os.environ.get("PP_USE_MOONCAKE", 0)) == 1:
+            pp_group = parallel_state.get_pipeline_model_parallel_group_mooncake(check_initialized=False)
+            if pp_group is None:
+                parallel_state.initialize_mooncake_pp_group()
+                pp_group = parallel_state.get_pipeline_model_parallel_group_mooncake()
+        else:
+            pp_group = self.pp_group
+
         if config.variable_seq_lengths or config.mtp_standalone:
             recv_prev_shape, recv_next_shape = self._communicate_shapes(
                 tensor_send_next, tensor_send_prev, recv_prev, recv_next
@@ -358,13 +366,6 @@ class P2PCommunicator:
         else:
             p2p_func = _p2p_ops
 
-        if int(os.environ.get("PP_USE_MOONCAKE", 0)) == 1:
-            pp_group = parallel_state.get_pipeline_model_parallel_group_mooncake(check_initialized=False)
-            if pp_group is None:
-                parallel_state.initialize_mooncake_pp_group()
-                pp_group = parallel_state.get_pipeline_model_parallel_group_mooncake()
-        else:
-            pp_group = self.pp_group
         next_rank = self.next_rank
         prev_rank = self.prev_rank
 
