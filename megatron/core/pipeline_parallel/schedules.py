@@ -1087,9 +1087,14 @@ def forward_backward_pipelining_with_interleaving(
     # print(f"total_num_microbatches = {total_num_microbatches}, are_all_microbatches_in_warmup = {are_all_microbatches_in_warmup}, num_warmup_microbatches = {num_warmup_microbatches}, num_microbatches_remaining = {num_microbatches_remaining}")
     # print(f"num_microbatches: {num_microbatches}, num_model_chunks = len(model) = {len(model)}, config.microbatch_group_size_per_vp_stage = {config.microbatch_group_size_per_vp_stage}")
     get_fine_grained_offload_handler().num_model_chunks = num_model_chunks
+    get_fine_grained_offload_handler().schedule_table_forward = schedule_table
     get_fine_grained_offload_handler().schedule_table_backward = get_schedule_table_backward(
         num_microbatches, len(model), config.microbatch_group_size_per_vp_stage
     )
+    get_fine_grained_offload_handler().make_should_offload_table(num_warmup_microbatches-1 if (config.overlap_moe_expert_parallel_comm and not are_all_microbatches_in_warmup) else num_warmup_microbatches)
+    
+    # print(f"schedule_table: {schedule_table}")
+    # print(f"schedule_table_backward: {get_fine_grained_offload_handler().schedule_table_backward}")
     
     for i in range(len(schedule_table)):
         get_fine_grained_offload_handler().microbatch_id_chunk_id_to_virtual_batch_id_backward[(get_fine_grained_offload_handler().schedule_table_backward[i][0], get_fine_grained_offload_handler().schedule_table_backward[i][1])] = i
