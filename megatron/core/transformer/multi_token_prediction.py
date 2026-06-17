@@ -47,6 +47,10 @@ try:
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
     HAVE_TE = True
+    from transformer_engine.pytorch.cpu_offload import (
+        get_fine_grained_offload_handler,
+        FineGrainedOffloadLayerCounter,
+    )
 except ImportError:
     HAVE_TE = False
 
@@ -955,6 +959,11 @@ class MultiTokenPredictionBlock(MegatronModule):
         self._build_layers(model_comm_pgs)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
         self.cp_group = model_comm_pgs.cp
+        
+        if get_fine_grained_offload_handler().num_layers == None:
+            get_fine_grained_offload_handler().num_layers = len(self.layers)
+        else:
+            get_fine_grained_offload_handler().num_layers = max(get_fine_grained_offload_handler().num_layers, len(self.layers))
 
     def _build_layers(self, model_comm_pgs):
         def build_layer(layer_spec, layer_number):
@@ -1022,6 +1031,11 @@ class MultiTokenPredictionBlock(MegatronModule):
                 embedding=embedding,
                 **(extra_block_kwargs or {}),
             )
+            if self.config.offload_moe_fc1_input or self.config.offload_moe_fused_swiglu_input:
+                hidden_states = FineGrainedOffloadLayerCounter.apply(hidden_states)
+                hidden_states = make_viewless_tensor(
+                    inp=hidden_states, requires_grad=True, keep_graph=True
+                )
 
             # append the output hidden states of the current mtp layer
             # to the hidden_states_list
