@@ -322,10 +322,8 @@ class TransformerBlock(MegatronModule):
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
         
-        if get_fine_grained_offload_handler().num_layers == None:
-            get_fine_grained_offload_handler().num_layers = len(self.layers)
-        else:
-            get_fine_grained_offload_handler().num_layers = max(get_fine_grained_offload_handler().num_layers, len(self.layers))
+        get_fine_grained_offload_handler().num_layers = len(self.layers)
+        get_fine_grained_offload_handler().pp_size = self.config.pipeline_model_parallel_size
 
     def _build_layers(self):
         # Transformer layers.

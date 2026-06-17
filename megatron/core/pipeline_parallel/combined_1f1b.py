@@ -130,8 +130,6 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     pre_backward=None,
     post_forward=None,
     post_backward=None,
-    f_microbatch_id_layer_id=None,
-    b_microbatch_id_layer_id=None,
 ):
     """Helper method to run combined forward and backward step for A2A communication hiding.
     This method merges the functionality of `forward_step_helper` and `backward_step_helper` and
@@ -223,8 +221,6 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
             else None
         ),
         current_microbatch=f_microbatch_id,
-        f_microbatch_id_layer_id=f_microbatch_id_layer_id,
-        b_microbatch_id_layer_id=b_microbatch_id_layer_id,
     )
     # forward post process
     if f_model_chunk_id is not None:
@@ -260,8 +256,6 @@ def combined_forward_backward_step(
     is_first_microbatch=False,
     current_microbatch=None,
     encoder_decoder_xattn=False,
-    f_microbatch_id_layer_id=None,
-    b_microbatch_id_layer_id=None,
 ):
     """Merged forward and backward step for combined 1f1b scheduler.
 
@@ -403,8 +397,6 @@ def combined_forward_backward_step(
             pre_backward=pre_backward,
             post_forward=post_forward,
             post_backward=post_backward,
-            f_microbatch_id_layer_id=f_microbatch_id_layer_id,
-            b_microbatch_id_layer_id=b_microbatch_id_layer_id,
         )
 
     # forward post process

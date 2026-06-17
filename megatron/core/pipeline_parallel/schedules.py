@@ -1087,14 +1087,9 @@ def forward_backward_pipelining_with_interleaving(
     # print(f"total_num_microbatches = {total_num_microbatches}, are_all_microbatches_in_warmup = {are_all_microbatches_in_warmup}, num_warmup_microbatches = {num_warmup_microbatches}, num_microbatches_remaining = {num_microbatches_remaining}")
     # print(f"num_microbatches: {num_microbatches}, num_model_chunks = len(model) = {len(model)}, config.microbatch_group_size_per_vp_stage = {config.microbatch_group_size_per_vp_stage}")
     get_fine_grained_offload_handler().num_model_chunks = num_model_chunks
-    get_fine_grained_offload_handler().schedule_table_forward = schedule_table
     get_fine_grained_offload_handler().schedule_table_backward = get_schedule_table_backward(
         num_microbatches, len(model), config.microbatch_group_size_per_vp_stage
     )
-    get_fine_grained_offload_handler().make_should_offload_table(num_warmup_microbatches-1 if (config.overlap_moe_expert_parallel_comm and not are_all_microbatches_in_warmup) else num_warmup_microbatches)
-    
-    # print(f"schedule_table: {schedule_table}")
-    # print(f"schedule_table_backward: {get_fine_grained_offload_handler().schedule_table_backward}")
     
     for i in range(len(schedule_table)):
         get_fine_grained_offload_handler().microbatch_id_chunk_id_to_virtual_batch_id_backward[(get_fine_grained_offload_handler().schedule_table_backward[i][0], get_fine_grained_offload_handler().schedule_table_backward[i][1])] = i
@@ -1200,9 +1195,8 @@ def forward_backward_pipelining_with_interleaving(
 
     def forward_step_helper_preprocess(virtual_microbatch_id, model_chunk_id, microbatch_id):
         """Preprocess for forward_step_helper"""
-        if not config.overlap_moe_expert_parallel_comm:
-            forward_layer_id_in_pipeline = model_chunk_id * get_fine_grained_offload_handler().num_layers
-            get_fine_grained_offload_handler().start_microbatch_forward(microbatch_id, current_layer_id = forward_layer_id_in_pipeline)
+        forward_layer_id_in_pipeline = model_chunk_id * get_fine_grained_offload_handler().num_layers
+        get_fine_grained_offload_handler().start_microbatch_forward(microbatch_id, current_layer_id = forward_layer_id_in_pipeline)
         # launch param synchronization for next model chunk
         # Note: Asynchronous communication tends to slow down compute.
         # To reduce idling from mismatched microbatch times, we launch
@@ -1288,10 +1282,9 @@ def forward_backward_pipelining_with_interleaving(
 
     def backward_step_helper_preprocess(virtual_microbatch_id, model_chunk_id):
         """Preprocess for backward_step_helper"""
-        if not config.overlap_moe_expert_parallel_comm:
-            backward_layer_id_in_pipeline = (model_chunk_id + 1) * get_fine_grained_offload_handler().num_layers
-            microbatch_id = get_microbatch_id_in_model_chunk(virtual_microbatch_id, forward=True)
-            get_fine_grained_offload_handler().start_microbatch_backward(microbatch_id, current_layer_id = backward_layer_id_in_pipeline)
+        backward_layer_id_in_pipeline = (model_chunk_id + 1) * get_fine_grained_offload_handler().num_layers
+        microbatch_id = get_microbatch_id_in_model_chunk(virtual_microbatch_id, forward=True)
+        get_fine_grained_offload_handler().start_microbatch_backward(microbatch_id, current_layer_id = backward_layer_id_in_pipeline)
         # launch grad synchronization (default)
         if config.grad_sync_func is None and is_last_microbatch_for_model_chunk(
             virtual_microbatch_id
@@ -1365,21 +1358,6 @@ def forward_backward_pipelining_with_interleaving(
         wrap forward_helper, backward_helper, and combined_forward_backward_helper in a unified way
         """
         if config.overlap_moe_expert_parallel_comm and not forward_only:  # Combined 1F1B path
-            
-            f_microbatch_id_layer_id = None
-            if f_virtual_microbatch_id is not None:
-                f_microbatch_id = get_microbatch_id_in_model_chunk(f_virtual_microbatch_id, forward=True)
-                f_model_chunk_id = get_model_chunk_id(f_virtual_microbatch_id, forward=True)
-                f_layer_id_in_pipeline = f_model_chunk_id * get_fine_grained_offload_handler().num_layers
-                f_microbatch_id_layer_id = (f_microbatch_id, f_layer_id_in_pipeline)
-            b_microbatch_id_layer_id = None
-            if b_virtual_microbatch_id is not None:
-                b_microbatch_id = get_microbatch_id_in_model_chunk(b_virtual_microbatch_id, forward=True)
-                b_model_chunk_id = get_model_chunk_id(b_virtual_microbatch_id, forward=False)
-                b_layer_id_in_pipeline = (b_model_chunk_id + 1) * get_fine_grained_offload_handler().num_layers - 1
-                b_microbatch_id_layer_id = (b_microbatch_id, b_layer_id_in_pipeline)
-            
-             
             return combined_1f1b_schedule_for_interleaved_pipelining(
                 config,
                 forward_step_func,
@@ -1402,8 +1380,6 @@ def forward_backward_pipelining_with_interleaving(
                 pre_backward=pre_backward,
                 post_forward=post_forward,
                 post_backward=post_backward,
-                f_microbatch_id_layer_id=f_microbatch_id_layer_id,
-                b_microbatch_id_layer_id=b_microbatch_id_layer_id,
             )
         else:  # Conventional interleaved 1F1B path
             forward_output_tensor = None
@@ -1419,8 +1395,8 @@ def forward_backward_pipelining_with_interleaving(
                 if finish_warm_up == True:
                     # print(f"finish warm up -> get_fine_grained_offload_handler().current_layer_id = {get_fine_grained_offload_handler().current_layer_id}, f_virtual_microbatch_id = {f_virtual_microbatch_id}, b_virtual_microbatch_id = {b_virtual_microbatch_id}")
                     reloading_microbatch_id = 0
-                    reloading_layer_id = len(get_fine_grained_offload_handler().moe_layer_pattern) - 1
-                    get_fine_grained_offload_handler().current_layer_id = len(get_fine_grained_offload_handler().moe_layer_pattern) - 1
+                    reloading_layer_id = num_model_chunks * get_fine_grained_offload_handler().num_layers - 1
+                    get_fine_grained_offload_handler().current_layer_id = num_model_chunks * get_fine_grained_offload_handler().num_layers - 1
                     if config.offload_moe_fc1_input:
                         get_fine_grained_offload_handler().launch_reload('moe_fc1_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
                     if config.offload_moe_fused_swiglu_input:
@@ -1635,30 +1611,11 @@ def forward_backward_pipelining_with_interleaving(
 
                 if recv_next:
                     output_tensor_grads[num_model_chunks - 1].append(bwd_recv_buffer[-1])
-                    
-        if config.overlap_moe_expert_parallel_comm and k == num_warmup_microbatches - 1:
-            reloading_microbatch_id = 0
-            reloading_layer_id = len(get_fine_grained_offload_handler().moe_layer_pattern) - 1
-            get_fine_grained_offload_handler().current_layer_id = len(get_fine_grained_offload_handler().moe_layer_pattern) - 1
-            if config.offload_moe_fc1_input:
-                get_fine_grained_offload_handler().launch_reload('moe_fc1_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
-            if config.offload_moe_fused_swiglu_input:
-                get_fine_grained_offload_handler().launch_reload('moe_fused_swiglu_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
-            
     nvtx_range_pop(suffix="warmup")
 
     # Run 1F1B in steady state.
     nvtx_range_push(suffix="steady")
     for k in range(num_microbatches_remaining):
-        if config.overlap_moe_expert_parallel_comm and k == 0:
-            reloading_microbatch_id = 0
-            reloading_layer_id = len(get_fine_grained_offload_handler().moe_layer_pattern) - 1
-            get_fine_grained_offload_handler().current_layer_id = len(get_fine_grained_offload_handler().moe_layer_pattern) - 1
-            if config.offload_moe_fc1_input:
-                get_fine_grained_offload_handler().wait_reload('moe_fc1_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
-            if config.offload_moe_fused_swiglu_input:
-                get_fine_grained_offload_handler().wait_reload('moe_fused_swiglu_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
-            
         # Forward pass.
         forward_k = k + num_warmup_microbatches
 
