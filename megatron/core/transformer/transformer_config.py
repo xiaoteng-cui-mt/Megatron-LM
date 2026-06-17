@@ -665,6 +665,7 @@ class TransformerConfig(ModelParallelConfig):
 
     offload_moe_fc1_input = None
     offload_moe_fused_swiglu_input = None
+    pre_offload_moe_fused_swiglu_input = True
     """patch for verl"""
 
     def __post_init__(self):

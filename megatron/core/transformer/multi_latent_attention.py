@@ -55,6 +55,9 @@ try:
         set_save_original_input,
     )
     from megatron.core.post_training.modelopt.layers import Linear
+    from transformer_engine.pytorch.cpu_offload import get_fine_grained_offload_handler
+    from transformer_engine.pytorch.cpu_offload import LaunchReloadFunction, WaitReloadFunction
+    
 
     HAVE_TE = True
 except ImportError:
@@ -204,6 +207,10 @@ class MultiLatentAttention(Attention):
         *,
         inference_params=None,
     ):
+        if self.config.offload_moe_fused_swiglu_input and self.config.pre_offload_moe_fused_swiglu_input:
+            get_fine_grained_offload_handler().launch_offload('moe_fused_swiglu_input')
+            hidden_states = WaitReloadFunction.apply(hidden_states, 'moe_fused_swiglu_input')
+            
         """Forward pass for multi-latent attention"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
         assert attention_bias is None, "Attention bias should not be passed into MLA."

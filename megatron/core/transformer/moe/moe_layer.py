@@ -189,6 +189,10 @@ class MoELayer(BaseMoELayer):
         tokens and their associated probabilities to the devices hosting their assigned
         experts.
         """
+        if self.config.offload_moe_fused_swiglu_input and self.config.pre_offload_moe_fused_swiglu_input:
+            get_fine_grained_offload_handler().wait_offload('moe_fused_swiglu_input')
+            hidden_states = LaunchReloadFunction.apply(hidden_states, 'moe_fused_swiglu_input')
+            
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
     def experts_compute(
@@ -205,7 +209,7 @@ class MoELayer(BaseMoELayer):
         if self.config.offload_moe_fc1_input:
             get_fine_grained_offload_handler().launch_offload('moe_fc1_input')
             hidden_states = WaitReloadFunction.apply(hidden_states, 'moe_fc1_input')
-        if self.config.offload_moe_fused_swiglu_input:
+        if self.config.offload_moe_fused_swiglu_input and not self.config.pre_offload_moe_fused_swiglu_input:
             get_fine_grained_offload_handler().launch_offload('moe_fused_swiglu_input')
             hidden_states = WaitReloadFunction.apply(hidden_states, 'moe_fused_swiglu_input')
         
@@ -237,7 +241,7 @@ class MoELayer(BaseMoELayer):
         if self.config.offload_moe_fc1_input:
             get_fine_grained_offload_handler().wait_offload('moe_fc1_input')
             output = LaunchReloadFunction.apply(output, 'moe_fc1_input')
-        if self.config.offload_moe_fused_swiglu_input:
+        if self.config.offload_moe_fused_swiglu_input and not self.config.pre_offload_moe_fused_swiglu_input:
             get_fine_grained_offload_handler().wait_offload('moe_fused_swiglu_input')
             output = LaunchReloadFunction.apply(output, 'moe_fused_swiglu_input')
 
