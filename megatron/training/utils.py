@@ -486,7 +486,9 @@ def get_blend_and_blend_per_split(args):
     return blend, blend_per_split
 
 
-def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
+def get_batch_on_this_tp_rank(
+    data_iterator, mtp_on_this_rank: bool = False, mtp_loss_on_this_rank: bool = False
+):
 
     args = get_args()
 
@@ -531,13 +533,20 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
         elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
-            # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
-            # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
-            if args.mtp_num_layers is not None:
+            if args.mtp_num_layers is not None and mtp_on_this_rank:
                 _broadcast(batch['tokens'])
                 _broadcast(batch['position_ids'])
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
+            _broadcast(batch['attention_mask'])
+
+        elif mtp_on_this_rank or mtp_loss_on_this_rank:
+            if mtp_on_this_rank:
+                _broadcast(batch['tokens'])
+                _broadcast(batch['position_ids'])
+            if mtp_loss_on_this_rank:
+                _broadcast(batch['labels'])
+                _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
 
     else:
@@ -588,9 +597,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
         elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
-            # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
-            # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
-            if args.mtp_num_layers is not None:
+            if args.mtp_num_layers is not None and mtp_on_this_rank:
                 _broadcast(tokens)
                 _broadcast(position_ids)
             else:
@@ -599,6 +606,21 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
             _broadcast(labels)
             _broadcast(loss_mask)
+            _broadcast(attention_mask)
+
+        elif mtp_on_this_rank or mtp_loss_on_this_rank:
+            if mtp_on_this_rank:
+                _broadcast(tokens)
+                _broadcast(position_ids)
+            else:
+                tokens = None
+                position_ids = None
+            if mtp_loss_on_this_rank:
+                _broadcast(labels)
+                _broadcast(loss_mask)
+            else:
+                labels = None
+                loss_mask = None
             _broadcast(attention_mask)
 
         batch = {
