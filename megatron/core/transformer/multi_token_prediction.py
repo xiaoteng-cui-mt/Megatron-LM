@@ -375,41 +375,6 @@ def mtp_on_this_rank(
     return mtp_on_this_rank
 
 
-def mtp_loss_on_this_rank(
-    config: TransformerConfig, ignore_virtual: Optional[bool] = True, vp_stage: Optional[int] = None
-) -> bool:
-    """Check if there is a standalone MTP loss stage on the current rank."""
-    if config.pipeline_model_parallel_layout is None:
-        return False
-
-    mtp_loss_on_rank = False
-    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-    layout = config.pipeline_model_parallel_layout.layout
-    if (
-        not ignore_virtual
-        and parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
-    ):
-        assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
-        return LayerType.mtp_loss in layout[pp_rank][vp_stage]
-
-    for vpp_rank in range(len(layout[pp_rank])):
-        if LayerType.mtp_loss in layout[pp_rank][vpp_rank]:
-            mtp_loss_on_rank = True
-            break
-    return mtp_loss_on_rank
-
-
-def get_mtp_loss_ranks(pp_ranks: List[int], config: TransformerConfig) -> List[int]:
-    """Get the ranks of standalone MTP loss stages."""
-    mtp_loss_ranks = set()
-    if config.pipeline_model_parallel_layout is None:
-        return []
-    layout = config.pipeline_model_parallel_layout.layout
-    for pp_rank in range(len(layout)):
-        for vpp_rank in range(len(layout[pp_rank])):
-            if LayerType.mtp_loss in layout[pp_rank][vpp_rank]:
-                mtp_loss_ranks.add(pp_ranks[pp_rank])
-    return list(mtp_loss_ranks)
 def get_mtp_ranks(pp_ranks: List[int], config: TransformerConfig) -> List[int]:
     """Get the ranks of the MTP layers."""
     mtp_ranks = set()

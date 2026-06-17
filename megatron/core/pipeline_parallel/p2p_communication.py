@@ -164,9 +164,7 @@ class P2PCommunicator:
             else None
         )
 
-    def _communicate_shapes(
-        self, tensor_send_next, tensor_send_prev, recv_prev, recv_next, pp_group=None
-    ):
+    def _communicate_shapes(self, tensor_send_next, tensor_send_prev, recv_prev, recv_next):
         """Communicate tensor shapes between stages. Used to communicate
         tensor shapes before the actual tensor communication happens.
         This is required when the sequence lengths across micro batches
@@ -185,7 +183,6 @@ class P2PCommunicator:
             (recv_prev_shape, recv_next_shape)
         """
         config = self.config
-        pp_group = self.pp_group if pp_group is None else pp_group
         recv_prev_shape_tensor = None
         recv_next_shape_tensor = None
         send_prev_shape_tensor = None
@@ -213,28 +210,28 @@ class P2PCommunicator:
                 tensor_recv_prev=recv_prev_shape_tensor,
                 tensor_send_next=send_next_shape_tensor,
                 tensor_recv_next=recv_next_shape_tensor,
-                group=pp_group,
+                group=self.pp_group,
             )
         else:
             ops = []
             if send_prev_shape_tensor is not None:
                 send_prev_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank, pp_group
+                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank, self.pp_group
                 )
                 ops.append(send_prev_op)
             if recv_prev_shape_tensor is not None:
                 recv_prev_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank, pp_group
+                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank, self.pp_group
                 )
                 ops.append(recv_prev_op)
             if send_next_shape_tensor is not None:
                 send_next_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_next_shape_tensor, self.next_rank, pp_group
+                    torch.distributed.isend, send_next_shape_tensor, self.next_rank, self.pp_group
                 )
                 ops.append(send_next_op)
             if recv_next_shape_tensor is not None:
                 recv_next_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank, pp_group
+                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank, self.pp_group
                 )
                 ops.append(recv_next_op)
             if len(ops) > 0:
@@ -313,7 +310,7 @@ class P2PCommunicator:
 
         if config.variable_seq_lengths or config.mtp_standalone:
             recv_prev_shape, recv_next_shape = self._communicate_shapes(
-                tensor_send_next, tensor_send_prev, recv_prev, recv_next, pp_group=pp_group
+                tensor_send_next, tensor_send_prev, recv_prev, recv_next
             )
         else:
             recv_prev_shape = tensor_shape

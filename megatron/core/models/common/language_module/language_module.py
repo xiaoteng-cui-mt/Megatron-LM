@@ -203,11 +203,7 @@ class LanguageModule(MegatronModule):
         ):
             self.shared_embedding_or_output_weight().shared_embedding = True
 
-        if (
-            self.post_process
-            or getattr(self, 'mtp_process', False)
-            or getattr(self, 'mtp_loss_process', False)
-        ) and not self.pre_process:
+        if (self.post_process or getattr(self, 'mtp_process', False)) and not self.pre_process:
             assert not (
                 is_vp_first_stage(self.vp_stage, self.vp_size) and is_pp_first_stage(self.pp_group)
             )

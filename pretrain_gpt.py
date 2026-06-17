@@ -30,7 +30,6 @@ from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer.multi_token_prediction import mtp_loss_on_this_rank, mtp_on_this_rank
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import StragglerDetector
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
@@ -199,40 +198,17 @@ def model_provider(
     return model
 
 
-def get_batch(data_iterator, model=None):
+def get_batch(data_iterator):
     """Generate a batch."""
 
-    model_config = None
-    vp_stage = None
-    if model is not None:
-        unwrapped_model = model
-        while hasattr(unwrapped_model, 'module'):
-            unwrapped_model = unwrapped_model.module
-        model_config = getattr(unwrapped_model, 'config', None)
-        vp_stage = getattr(unwrapped_model, 'vp_stage', None)
-
-    has_mtp = (
-        model_config is not None
-        and getattr(model_config, 'mtp_num_layers', None) is not None
-        and mtp_on_this_rank(model_config, ignore_virtual=False, vp_stage=vp_stage)
-    )
-    has_mtp_loss = model_config is not None and mtp_loss_on_this_rank(
-        model_config, ignore_virtual=False, vp_stage=vp_stage
-    )
-
     # TODO: this is pretty hacky, find a better way
-    if (
-        (not parallel_state.is_pipeline_first_stage(ignore_virtual=True))
-        and (not parallel_state.is_pipeline_last_stage(ignore_virtual=True))
-        and (not has_mtp)
-        and (not has_mtp_loss)
+    if (not parallel_state.is_pipeline_first_stage(ignore_virtual=True)) and (
+        not parallel_state.is_pipeline_last_stage(ignore_virtual=True)
     ):
         return None, None, None, None, None
 
     # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(
-        data_iterator, mtp_on_this_rank=has_mtp, mtp_loss_on_this_rank=has_mtp_loss
-    )
+    batch = get_batch_on_this_tp_rank(data_iterator)
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
@@ -321,7 +297,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator, model)
+        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
     timers('batch-generator').stop()
 
     with stimer:
@@ -345,18 +321,10 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
 
 def is_dataset_built_on_rank():
-    args = get_args()
-    if args.yaml_cfg is not None:
-        config = core_transformer_config_from_yaml(args, "language_model")
-    else:
-        config = core_transformer_config_from_args(args)
-    needs_batch = (
+    return (
         parallel_state.is_pipeline_first_stage(ignore_virtual=True)
         or parallel_state.is_pipeline_last_stage(ignore_virtual=True)
-        or mtp_on_this_rank(config, ignore_virtual=True)
-        or mtp_loss_on_this_rank(config, ignore_virtual=True)
-    )
-    return needs_batch and parallel_state.get_tensor_model_parallel_rank() == 0
+    ) and parallel_state.get_tensor_model_parallel_rank() == 0
 
 
 def core_gpt_dataset_config_from_args(args):

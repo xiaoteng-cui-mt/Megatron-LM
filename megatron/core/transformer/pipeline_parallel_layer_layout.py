@@ -100,38 +100,20 @@ class PipelineParallelLayerLayout:
             self.flatten_layout.count(LayerType.embedding) == 1
         ), "Embedding must be specified exactly once"
         assert self.flatten_layout.count(LayerType.loss) == 1, "Loss must be specified exactly once"
-        assert (
-            self.flatten_layout.count(LayerType.mtp_loss) <= 1
-        ), "MTP loss must be specified at most once"
         assert self.flatten_layout.count(LayerType.decoder) == num_layers, (
             f"Number of decoder layers {self.flatten_layout.count(LayerType.decoder)}"
             f"must match num_layers {num_layers}"
         )
         # MTP layer verification
-        mtp_layer_count = self.flatten_layout.count(LayerType.mtp)
-        mtp_loss_count = self.flatten_layout.count(LayerType.mtp_loss)
-        assert mtp_layer_count == mtp_num_layers or (
-            mtp_num_layers is None and mtp_layer_count == 0
+        assert self.flatten_layout.count(LayerType.mtp) == mtp_num_layers or (
+            mtp_num_layers is None and self.flatten_layout.count(LayerType.mtp) == 0
         ), "Number of mtp layers in layout must match mtp_num_layers"
-        assert (
-            mtp_loss_count == 0 or mtp_layer_count > 0
-        ), "MTP loss stage requires MTP layers"
-
-        first_mtp_idx = None
-        if mtp_layer_count > 0:
-            first_mtp_idx = self.flatten_layout.index(LayerType.mtp)
-            last_mtp_idx = len(self.flatten_layout) - 1 - self.flatten_layout[::-1].index(LayerType.mtp)
-            assert (
-                self.flatten_layout[first_mtp_idx:].count(LayerType.decoder) == 0
-            ), "decoder layers must be placed before MTP layers"
-            if mtp_loss_count > 0:
-                mtp_loss_idx = self.flatten_layout.index(LayerType.mtp_loss)
+        for i in range(len(self.flatten_layout)):
+            if self.flatten_layout[i] == LayerType.mtp:
                 assert (
-                    last_mtp_idx < mtp_loss_idx < len(self.flatten_layout) - 1
-                ), "MTP loss stage must be after MTP layers and before final loss"
-        elif mtp_loss_count > 0:
-            raise AssertionError("MTP loss stage requires MTP layers")
-
+                    self.flatten_layout[i:].count(LayerType.decoder) == 0
+                ), "decoder layers must be placed before MTP layers"
+                break
         for pp_rank in range(self.pipeline_model_parallel_size):
             for vpp_rank in range(self.virtual_pipeline_model_parallel_size - 1):
                 assert (
@@ -152,9 +134,9 @@ class PipelineParallelLayerLayout:
                 f"Currently we restrict that the MTP should not be in the first pp rank."
                 f"But got {self.layout[0]} for the first pp rank."
             )
-
+        
         ## Detect MTP standalone usage.
-        mtp_standalone = mtp_loss_count > 0
+        mtp_standalone = False
         for pp_rank in range(self.pipeline_model_parallel_size):
             if (
                 LayerType.mtp in self.layout[pp_rank][-1]
@@ -312,7 +294,6 @@ class PipelineParallelLayerLayout:
             "L": LayerType.loss,
             "t": LayerType.decoder,  # t denotes "transformer"
             "m": LayerType.mtp,
-            "M": LayerType.mtp_loss,
         }
 
         # parse the layout string
