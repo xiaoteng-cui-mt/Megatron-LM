@@ -911,7 +911,7 @@ class TEGroupedMLP(MegatronModule):
         if self.activation_recompute:
             from transformer_engine.pytorch.cpu_offload import get_fine_grained_offload_handler
             fine_grained_offload_handler = get_fine_grained_offload_handler()
-            if self.config.offload_moe_fused_swiglu_input and not fine_grained_offload_handler.is_last_2_pipeline_parallel_stage() and not fine_grained_offload_handler.is_last_batch_last_layer():
+            if self.config.offload_moe_fused_swiglu_input and fine_grained_offload_handler.should_offload():
                 self.activation_checkpoint = tensor_parallel.OffloadFirstInputAndCheckpointWithoutOutput()
             else:
                 self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
