@@ -1359,7 +1359,8 @@ def forward_backward_pipelining_with_interleaving(
         post_forward=None,
         post_backward=None,
         checkpoint_activations_microbatch=None,
-        finish_warm_up=None,
+        finish_warm_up_launch_reload=None,
+        finish_warm_up_wait_reload=None,
     ):
         """
         wrap forward_helper, backward_helper, and combined_forward_backward_helper in a unified way
@@ -1413,14 +1414,21 @@ def forward_backward_pipelining_with_interleaving(
                 forward_model_chunk_id = get_model_chunk_id(f_virtual_microbatch_id, forward=True)
                 if pre_forward is not None:
                     pre_forward()
+                if finish_warm_up_wait_reload == True:
+                    reloading_microbatch_id = 0
+                    reloading_layer_id = len(get_fine_grained_offload_handler().moe_layer_pattern) - 1
+                    if config.offload_moe_fc1_input:
+                        get_fine_grained_offload_handler().wait_reload('moe_fc1_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
+                    if config.offload_moe_fused_swiglu_input:
+                        get_fine_grained_offload_handler().wait_reload('moe_fused_swiglu_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
+                
                 forward_output_tensor = forward_step_helper(
                     f_virtual_microbatch_id, checkpoint_activations_microbatch
                 )
-                if finish_warm_up == True:
-                    # print(f"finish warm up -> get_fine_grained_offload_handler().current_layer_id = {get_fine_grained_offload_handler().current_layer_id}, f_virtual_microbatch_id = {f_virtual_microbatch_id}, b_virtual_microbatch_id = {b_virtual_microbatch_id}")
+
+                if finish_warm_up_launch_reload == True:
                     reloading_microbatch_id = 0
                     reloading_layer_id = len(get_fine_grained_offload_handler().moe_layer_pattern) - 1
-                    get_fine_grained_offload_handler().current_layer_id = len(get_fine_grained_offload_handler().moe_layer_pattern) - 1
                     if config.offload_moe_fc1_input:
                         get_fine_grained_offload_handler().launch_reload('moe_fc1_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
                     if config.offload_moe_fused_swiglu_input:
@@ -1433,11 +1441,6 @@ def forward_backward_pipelining_with_interleaving(
                 backward_model_chunk_id = get_model_chunk_id(b_virtual_microbatch_id, forward=False)
                 if pre_backward is not None:
                     pre_backward()
-                if finish_warm_up == True:
-                    if config.offload_moe_fc1_input:
-                        get_fine_grained_offload_handler().wait_reload('moe_fc1_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
-                    if config.offload_moe_fused_swiglu_input:
-                        get_fine_grained_offload_handler().wait_reload('moe_fused_swiglu_input', reloading_microbatch_id = reloading_microbatch_id, reloading_layer_id = reloading_layer_id)
                     
                 backward_input_tensor_grad = backward_step_helper(b_virtual_microbatch_id)
                 if post_backward is not None:
@@ -1539,6 +1542,7 @@ def forward_backward_pipelining_with_interleaving(
         output_tensor, _ = forward_backward_helper_wrapper(
             f_virtual_microbatch_id=k,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+            finish_warm_up_launch_reload = (k==num_warmup_microbatches-1),
         )
 
         # Don't send tensor downstream if on last stage.
@@ -1830,7 +1834,7 @@ def forward_backward_pipelining_with_interleaving(
                 post_forward=pp_post_forward,
                 post_backward=pp_post_backward,
                 checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-                finish_warm_up = (k==0),
+                finish_warm_up_wait_reload = (k==0),
             )
 
         else:  # No p2p overlap.
@@ -1839,7 +1843,7 @@ def forward_backward_pipelining_with_interleaving(
                 f_virtual_microbatch_id=forward_k,
                 b_virtual_microbatch_id=backward_k,
                 checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-                finish_warm_up = (k==0),
+                finish_warm_up_wait_reload = (k==0),
             )
             # Send output_tensor and input_tensor_grad, receive input_tensor
             # and output_tensor_grad.
