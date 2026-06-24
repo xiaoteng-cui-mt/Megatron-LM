@@ -792,17 +792,15 @@ class GPTModel(LanguageModule):
             emb_weight_key = f'{prefix}embedding.word_embeddings.weight'
             emb_weight = self.embedding.word_embeddings.weight
             tie_word_embeddings_state_dict(sharded_state_dict, emb_weight, emb_weight_key)
-        
-        # MTP loss是在post_process阶段计算，所以在mtp_process 不需要output_layer的权重
-        # if self.mtp_process and not self.post_process:
-        #     # We only need to tie the output layer weight if share_embeddings_and_output_weights
-        #     # is False. Because if share_embeddings_and_output_weights is True, the shared weight
-        #     # will be stored in embedding layer, and output layer will not have any weight.
-        #     if not self.share_embeddings_and_output_weights:
-        #         output_layer_weight_key = f'{prefix}output_layer.weight'
-        #         output_layer_weight = self.output_layer.weight
-        #         tie_output_layer_state_dict(
-        #             sharded_state_dict, output_layer_weight, output_layer_weight_key
-        #         )
+
+        # A split MTP-loss stage needs output_layer for loss computation, but the
+        # final post_process stage owns the checkpoint's main output-layer shard.
+        if self.mtp_loss_process and not self.post_process:
+            if not self.share_embeddings_and_output_weights:
+                output_layer_weight_key = f'{prefix}output_layer.weight'
+                output_layer_weight = self.output_layer.weight
+                tie_output_layer_state_dict(
+                    sharded_state_dict, output_layer_weight, output_layer_weight_key
+                )
 
         return sharded_state_dict
