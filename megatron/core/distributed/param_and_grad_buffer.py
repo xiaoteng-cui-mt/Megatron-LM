@@ -3,6 +3,7 @@
 import functools
 import logging
 import math
+import os
 import warnings
 from contextlib import nullcontext
 from enum import Enum
@@ -73,6 +74,7 @@ class _ParamAndGradBucket:
             communication. Its application is twofold: it facilitates the averaging of gradients
             and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
         bucket_id: Index of bucket in buffer.
+        buffer_tag: Stable tag describing which parameter buffer owns this bucket.
     """
 
     def __init__(
@@ -84,6 +86,7 @@ class _ParamAndGradBucket:
         numel_unpadded: int,
         gradient_scaling_factor: float,
         bucket_id: int,
+        buffer_tag: str,
     ):
         self.params_list = params
         self.params = set(params)
@@ -97,6 +100,7 @@ class _ParamAndGradBucket:
         self.numel_unpadded = numel_unpadded
         self.gradient_scaling_factor = gradient_scaling_factor
         self.bucket_id = bucket_id
+        self.buffer_tag = buffer_tag
         self.param_to_index = {}
         offset = 0
         for param in params:
@@ -202,12 +206,30 @@ class _ParamAndGradBucketGroup:
                     fatal=True,
                 )
             if check_for_large:
+                large_grad_norm_threshold = os.getenv("MEGATRON_LARGE_GRAD_NORM_THRESHOLD")
+                try:
+                    large_grad_norm_threshold = float(large_grad_norm_threshold)
+                except (TypeError, ValueError):
+                    large_grad_norm_threshold = None
+
+                if large_grad_norm_threshold is not None and large_grad_norm_threshold > 0:
+                    large_grad_norm_rejection_func = (
+                        lambda result: result.item() >= large_grad_norm_threshold
+                    )
+                else:
+                    large_grad_norm_rejection_func = partial(
+                        rerun_state_machine.is_unexpectedly_large, threshold=10, context="grads"
+                    )
+                bucket = self.buckets[i]
+                stable_bucket_desc = f"bucket_id={bucket.buffer_tag}-{bucket.bucket_id}-{i}"
+                if grad_norm.item() > 1:
+                    print(
+                        f"grad norm info: {stable_bucket_desc}, iteration={rerun_state_machine.current_iteration}, grad_norm={grad_norm.item()}"
+                    )
                 rerun_state_machine.validate_result(
                     result=grad_norm,
-                    rejection_func=partial(
-                        rerun_state_machine.is_unexpectedly_large, threshold=10, context="grads"
-                    ),
-                    message=f"found unexpected large grads in bucket #{i} "
+                    rejection_func=large_grad_norm_rejection_func,
+                    message=f"found unexpected large grads in {stable_bucket_desc} "
                     f"in backward pass before data-parallel communication collective",
                     tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
                     fatal=False,
@@ -512,6 +534,7 @@ class _ParamAndGradBuffer:
         param_indices: The index of each param among the params with same dtype, if a param is fp8,
             use its "fake" high precision dtype to determine which params have same dtype with it.
             These indices are needed when loading a non-native-fp8 checkpoint in native-fp8 mode.
+        buffer_tag: Stable tag describing what kind of parameters this buffer owns.
     """
 
     def __init__(
@@ -526,10 +549,12 @@ class _ParamAndGradBuffer:
         gradient_scaling_factor: float,
         param_indices: List[int],
         nccl_ub: bool,
+        buffer_tag: str,
     ):
         self.ddp_config = ddp_config
         self.params = params
         self.param_indices = param_indices
+        self.buffer_tag = buffer_tag
 
         # Check that params are unique.
         unique_params = set()
@@ -847,6 +872,7 @@ class _ParamAndGradBuffer:
             numel_unpadded=numel_unpadded,
             gradient_scaling_factor=self.gradient_scaling_factor,
             bucket_id=bucket_id,
+            buffer_tag=self.buffer_tag,
         )
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket

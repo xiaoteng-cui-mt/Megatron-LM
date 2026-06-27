@@ -122,6 +122,7 @@ class RerunValidationStatus(str, Enum):
     FIRST_RERUN_REPRODUCIBLE = "first_rerun_reproducible"
     SECOND_RERUN_NOT_REPRODUCIBLE = "second_rerun_not_reproducible"
     SECOND_RERUN_REPRODUCIBLE = "second_rerun_reproducible"
+    SECOND_RERUN_UNEXPECTED_VALIDATION = "second_rerun_unexpected_validation"
 
 
 COMPARISON_MATCH: float = 0.0
@@ -208,6 +209,9 @@ class RerunStateMachine:
         self.restart_again_requested: bool = False
         # Request to resume normal execution when no HW fault was detected.
         self.continue_requested: bool = False
+        # Set when a second rerun fails at a different validation call than the initial failure.
+        # This is all-reduced before continue_requested so that any rank can block continuing.
+        self.unexpected_validation_failed_during_rerun: bool = False
         self.continue_on_transient_error: bool = continue_on_transient_error
         self.logged_sdc_enabled: bool = False
 
@@ -305,6 +309,11 @@ class RerunStateMachine:
             self.checkpoint_requested = False
             self.restart_again_requested = False
             self.continue_requested = False
+            self.unexpected_validation_failed_during_rerun = False
+            self.failed_validation_call = None
+            self.initial_result = None
+            self.suspicious_node = None
+            self.suspicious_device = None
             self.injected_result = None
             self.current_iteration += 1
             self.state = RerunState.INITIAL_RUN
@@ -383,6 +392,20 @@ class RerunStateMachine:
                     )
                 self.state = RerunState.RERUNNING_AGAIN_FROM_CHECKPOINT
             else:
+                will_fail_rerun_tensor: torch.Tensor = torch.tensor(
+                    [self.unexpected_validation_failed_during_rerun],
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                torch.distributed.all_reduce(will_fail_rerun_tensor)
+                if will_fail_rerun_tensor.item() > 0:
+                    if _safe_get_rank() == 0:
+                        logger.error(
+                            "Failing validation because a different validation call failed during "
+                            "the second rerun"
+                        )
+                    self.continue_requested = False
+                    return False
                 will_continue_tensor: torch.Tensor = torch.tensor(
                     [self.continue_requested], dtype=torch.int32, device="cuda"
                 )
@@ -390,7 +413,7 @@ class RerunStateMachine:
                 if will_continue_tensor.item() > 0:
                     if _safe_get_rank() == 0:
                         logger.warning(
-                            "Continuing normal execution because failed validation was not fatal"
+                            "Continuing normal execution because failed validation was not fatal or continue on transient error has been enabled"
                         )
                     self.state = RerunState.NOT_RUNNING_YET
             return False
@@ -594,7 +617,36 @@ class RerunStateMachine:
                     f"invokation #{validation_call.sequence} "
                     f"(message='{message}')"
                 )
-        # If this the first rerun (same GPU) or second 2nd rerun (different GPU), and have we
+        # If this is a rerun, keep checking other validation calls as well. A failure at a
+        # different validation call cannot be compared to the initial failure, but it should not
+        # be silently ignored.
+        elif (
+            self.state == RerunState.RERUNNING_FROM_CHECKPOINT
+            and validation_call != self.failed_validation_call
+        ):
+            result_rejected: bool = rejection_func(result)
+            if result_rejected:
+                self.unexpected_validation_failed_during_rerun = True
+                self.continue_requested = False
+                original_failed_sequence = (
+                    self.failed_validation_call.sequence
+                    if self.failed_validation_call is not None
+                    else "unknown"
+                )
+                self._log_validation_error_to_file(
+                    status=RerunValidationStatus.SECOND_RERUN_UNEXPECTED_VALIDATION,
+                    result=result,
+                    message=message,
+                )
+                logger.error(
+                    f"Unexpected result {result} "
+                    f"on rank {_safe_get_rank()} "
+                    f"at iteration #{self.current_iteration} "
+                    f"invokation #{validation_call.sequence} "
+                    f"(message='{message}'); original failed invokation was "
+                    f"#{original_failed_sequence}"
+                )
+        # If this is the first rerun (same GPU) or second rerun (different GPU), and have we
         # reached the validation call that failed during the initial run?
         elif (
             self.state in [RerunState.RERUNNING_IN_PLACE, RerunState.RERUNNING_FROM_CHECKPOINT]
@@ -648,7 +700,8 @@ class RerunStateMachine:
                             "loading from checkpoint, therefore continuing normal execution "
                             f"({result} != {self.initial_result})"
                         )
-                        self.continue_requested = True
+                        if not self.unexpected_validation_failed_during_rerun:
+                            self.continue_requested = True
                         return
 
                 # Ensure we're not on the same GPU as the first rerun.
@@ -682,7 +735,7 @@ class RerunStateMachine:
                         f"therefore it was likely correct ({result} = {self.initial_result})"
                     )
                     log_failure(f"Correct result (but possible Application error) ({message})")
-                    if not fatal:
+                    if not fatal and not self.unexpected_validation_failed_during_rerun:
                         self.continue_requested = True
             else:
                 raise RuntimeError("Should not be here")
