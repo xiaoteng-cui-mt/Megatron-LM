@@ -9,6 +9,7 @@ import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.transformer.enums import LayerType
 from megatron.core.utils import nvtx_decorator
 
 # Types
@@ -164,6 +165,220 @@ class P2PCommunicator:
             else None
         )
 
+    def _stage_output_shape_from_layout(
+        self, pp_rank: int, vp_stage: int, tensor_shape: Shape
+    ) -> Shape:
+        """Return the shape produced by a logical pipeline stage."""
+        if tensor_shape is None:
+            return [0, 0, 0]
+
+        output_shape = list(tensor_shape)
+        layout = getattr(self.config, "pipeline_model_parallel_layout", None)
+        if layout is None:
+            return output_shape
+
+        stage_layers = layout.layout[pp_rank][vp_stage]
+        if LayerType.loss in stage_layers:
+            return [0, 0, 0]
+        if LayerType.mtp_loss in stage_layers:
+            return output_shape
+        if LayerType.mtp in stage_layers:
+            output_shape[0] *= 1 + stage_layers.count(LayerType.mtp)
+        return output_shape
+
+    def _previous_logical_stage_from_layout(
+        self, pp_rank: int, vp_stage: int
+    ) -> Optional[Tuple[int, int]]:
+        """Return the logical stage that sends activations into this stage."""
+        if pp_rank > 0:
+            return pp_rank - 1, vp_stage
+        if vp_stage > 0:
+            return self.pp_group.size() - 1, vp_stage - 1
+        return None
+
+    def _next_logical_stage_from_layout(
+        self, pp_rank: int, vp_stage: int
+    ) -> Optional[Tuple[int, int]]:
+        """Return the logical stage that receives activations from this stage."""
+        if pp_rank < self.pp_group.size() - 1:
+            return pp_rank + 1, vp_stage
+        if vp_stage < self._layout_vpp_size() - 1:
+            return 0, vp_stage + 1
+        return None
+
+    def _layout_vpp_size(self) -> int:
+        layout = getattr(self.config, "pipeline_model_parallel_layout", None)
+        if layout is not None:
+            return layout.virtual_pipeline_model_parallel_size
+        return self.virtual_pipeline_model_parallel_size or 1
+
+    def _unique_nonzero_shape(self, shapes: List[Shape]) -> Optional[Shape]:
+        unique_shapes = []
+        for shape in shapes:
+            shape = list(shape)
+            if shape == [0, 0, 0]:
+                continue
+            if shape not in unique_shapes:
+                unique_shapes.append(shape)
+        if len(unique_shapes) == 1:
+            return unique_shapes[0]
+        return None
+
+    def _infer_recv_shape_from_layout(
+        self,
+        receiver_pp_rank: int,
+        recv_from_prev: bool,
+        tensor_shape: Shape,
+        vp_stage: Optional[int] = None,
+    ) -> Optional[Shape]:
+        """Infer one receive shape, returning None when VPP makes it ambiguous."""
+        layout = getattr(self.config, "pipeline_model_parallel_layout", None)
+        if layout is None or tensor_shape is None:
+            return None
+
+        candidate_shapes = []
+        vp_stages = [vp_stage] if vp_stage is not None else range(self._layout_vpp_size())
+        for candidate_vp_stage in vp_stages:
+            if recv_from_prev:
+                sender_stage = self._previous_logical_stage_from_layout(
+                    receiver_pp_rank, candidate_vp_stage
+                )
+                if sender_stage is None:
+                    continue
+                candidate_shapes.append(
+                    self._stage_output_shape_from_layout(
+                        sender_stage[0], sender_stage[1], tensor_shape
+                    )
+                )
+            else:
+                if (
+                    self._next_logical_stage_from_layout(
+                        receiver_pp_rank, candidate_vp_stage
+                    )
+                    is None
+                ):
+                    continue
+                candidate_shapes.append(
+                    self._stage_output_shape_from_layout(
+                        receiver_pp_rank, candidate_vp_stage, tensor_shape
+                    )
+                )
+
+        return self._unique_nonzero_shape(candidate_shapes)
+
+    def _can_infer_recv_shape_from_layout(
+        self, receiver_pp_rank: int, recv_from_prev: bool
+    ) -> bool:
+        return (
+            self._infer_recv_shape_from_layout(
+                receiver_pp_rank, recv_from_prev=recv_from_prev, tensor_shape=[1, 1, 1]
+            )
+            is not None
+        )
+
+    def _infer_recv_shapes_from_layout(
+        self,
+        *,
+        recv_prev: bool,
+        recv_next: bool,
+        tensor_shape: Shape,
+        recv_prev_vp_stage: Optional[int] = None,
+        recv_next_vp_stage: Optional[int] = None,
+    ) -> Optional[Tuple[Shape, Shape]]:
+        """Resolve receive shapes locally for fixed-sequence layout-driven P2P."""
+        pp_rank = self.pp_group.rank()
+        recv_prev_shape = [0, 0, 0]
+        recv_next_shape = [0, 0, 0]
+
+        if recv_prev:
+            recv_prev_shape = self._infer_recv_shape_from_layout(
+                pp_rank,
+                recv_from_prev=True,
+                tensor_shape=tensor_shape,
+                vp_stage=recv_prev_vp_stage,
+            )
+            if recv_prev_shape is None:
+                return None
+
+        if recv_next:
+            recv_next_shape = self._infer_recv_shape_from_layout(
+                pp_rank,
+                recv_from_prev=False,
+                tensor_shape=tensor_shape,
+                vp_stage=recv_next_vp_stage,
+            )
+            if recv_next_shape is None:
+                return None
+
+        return recv_prev_shape, recv_next_shape
+
+    def _peer_can_infer_send_shape(
+        self,
+        *,
+        tensor_send_next: Optional[torch.Tensor],
+        tensor_send_prev: Optional[torch.Tensor],
+        tensor_shape: Shape,
+    ) -> bool:
+        """Check whether peers receiving our sends can also skip shape exchange."""
+        pp_rank = self.pp_group.rank()
+        pp_size = self.pp_group.size()
+
+        if tensor_send_next is not None:
+            next_pp_rank = (pp_rank + 1) % pp_size
+            if not self._can_infer_recv_shape_from_layout(
+                next_pp_rank, recv_from_prev=True
+            ):
+                return False
+
+        if tensor_send_prev is not None:
+            prev_pp_rank = (pp_rank - 1) % pp_size
+            if not self._can_infer_recv_shape_from_layout(
+                prev_pp_rank, recv_from_prev=False
+            ):
+                return False
+
+        return True
+
+    def _can_infer_p2p_shapes_from_layout(
+        self,
+        *,
+        tensor_send_next: Optional[torch.Tensor],
+        tensor_send_prev: Optional[torch.Tensor],
+        recv_prev: bool,
+        recv_next: bool,
+        tensor_shape: Shape,
+        recv_prev_vp_stage: Optional[int] = None,
+        recv_next_vp_stage: Optional[int] = None,
+    ) -> Optional[Tuple[Shape, Shape]]:
+        if self.config.variable_seq_lengths:
+            return None
+        if getattr(self.config, "pipeline_model_parallel_layout", None) is None:
+            return None
+        if self._layout_vpp_size() > 1:
+            if recv_prev and recv_prev_vp_stage is None:
+                return None
+            if recv_next and recv_next_vp_stage is None:
+                return None
+
+        recv_shapes = self._infer_recv_shapes_from_layout(
+            recv_prev=recv_prev,
+            recv_next=recv_next,
+            tensor_shape=tensor_shape,
+            recv_prev_vp_stage=recv_prev_vp_stage,
+            recv_next_vp_stage=recv_next_vp_stage,
+        )
+        if recv_shapes is None:
+            return None
+        if self._layout_vpp_size() > 1:
+            return recv_shapes
+        if not self._peer_can_infer_send_shape(
+            tensor_send_next=tensor_send_next,
+            tensor_send_prev=tensor_send_prev,
+            tensor_shape=tensor_shape,
+        ):
+            return None
+        return recv_shapes
+
     def _communicate_shapes(
         self, tensor_send_next, tensor_send_prev, recv_prev, recv_next, pp_group=None
     ):
@@ -265,6 +480,8 @@ class P2PCommunicator:
         recv_next: bool,
         tensor_shape: Shape,
         wait_on_reqs: bool = True,
+        recv_prev_vp_stage: Optional[int] = None,
+        recv_next_vp_stage: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Communicate tensors between stages. Used as helper method in other
         communication methods that are used in megatron/schedules.py.
@@ -311,7 +528,19 @@ class P2PCommunicator:
         else:
             pp_group = self.pp_group
 
-        if config.variable_seq_lengths or config.mtp_standalone:
+        layout_shapes = self._can_infer_p2p_shapes_from_layout(
+            tensor_send_next=tensor_send_next,
+            tensor_send_prev=tensor_send_prev,
+            recv_prev=recv_prev,
+            recv_next=recv_next,
+            tensor_shape=tensor_shape,
+            recv_prev_vp_stage=recv_prev_vp_stage,
+            recv_next_vp_stage=recv_next_vp_stage,
+        )
+
+        if layout_shapes is not None:
+            recv_prev_shape, recv_next_shape = layout_shapes
+        elif config.variable_seq_lengths or config.mtp_standalone:
             recv_prev_shape, recv_next_shape = self._communicate_shapes(
                 tensor_send_next, tensor_send_prev, recv_prev, recv_next, pp_group=pp_group
             )
@@ -417,7 +646,7 @@ class P2PCommunicator:
 
     @nvtx_decorator()
     def recv_forward(
-        self, tensor_shapes, is_first_stage: bool
+        self, tensor_shapes, is_first_stage: bool, vp_stage: Optional[int] = None
     ) -> Union[torch.Tensor, list[torch.Tensor]]:
         """Receive tensor from previous rank in pipeline (forward receive)."""
         unwrap_tensor_shapes = False
@@ -438,6 +667,7 @@ class P2PCommunicator:
                     recv_prev=True,
                     recv_next=False,
                     tensor_shape=tensor_shape,
+                    recv_prev_vp_stage=vp_stage,
                 )
                 if config.timers is not None:
                     config.timers('forward-recv').stop()
@@ -448,7 +678,7 @@ class P2PCommunicator:
 
     @nvtx_decorator()
     def recv_backward(
-        self, tensor_shapes, is_last_stage: bool
+        self, tensor_shapes, is_last_stage: bool, vp_stage: Optional[int] = None
     ) -> Union[torch.Tensor, list[torch.Tensor]]:
         """Receive tensor from next rank in pipeline (backward receive)."""
         unwrap_tensor_shapes = False
@@ -469,6 +699,7 @@ class P2PCommunicator:
                     recv_prev=False,
                     recv_next=True,
                     tensor_shape=tensor_shape,
+                    recv_next_vp_stage=vp_stage,
                 )
                 if config.timers is not None:
                     config.timers('backward-recv').stop()
@@ -591,6 +822,7 @@ class P2PCommunicator:
         recv_prev: bool,
         tensor_shape: Shape,
         overlap_p2p_comm: bool = False,
+        recv_prev_vp_stage: Optional[int] = None,
     ) -> torch.Tensor:
         """Batched recv from previous rank and send to next rank in pipeline."""
         config = self.config
@@ -603,6 +835,7 @@ class P2PCommunicator:
             recv_next=False,
             tensor_shape=tensor_shape,
             wait_on_reqs=(not overlap_p2p_comm),
+            recv_prev_vp_stage=recv_prev_vp_stage,
         )
         if config.timers is not None:
             config.timers('forward-send-forward-recv').stop()
@@ -617,6 +850,7 @@ class P2PCommunicator:
         recv_next: bool,
         tensor_shape: Shape,
         overlap_p2p_comm: bool = False,
+        recv_next_vp_stage: Optional[int] = None,
     ) -> torch.Tensor:
         """Batched recv from next rank and send to previous rank in pipeline."""
         config = self.config
@@ -629,6 +863,7 @@ class P2PCommunicator:
             recv_next=recv_next,
             tensor_shape=tensor_shape,
             wait_on_reqs=(not overlap_p2p_comm),
+            recv_next_vp_stage=recv_next_vp_stage,
         )
         if config.timers is not None:
             config.timers('backward-send-backward-recv').stop()
@@ -644,6 +879,8 @@ class P2PCommunicator:
         recv_prev: bool,
         recv_next: bool,
         tensor_shape: Shape,
+        recv_prev_vp_stage: Optional[int] = None,
+        recv_next_vp_stage: Optional[int] = None,
     ) -> torch.Tensor:
         """Batched send and recv with previous and next ranks in pipeline."""
         config = self.config
@@ -655,6 +892,8 @@ class P2PCommunicator:
             recv_prev=recv_prev,
             recv_next=recv_next,
             tensor_shape=tensor_shape,
+            recv_prev_vp_stage=recv_prev_vp_stage,
+            recv_next_vp_stage=recv_next_vp_stage,
         )
         if config.timers is not None:
             config.timers('forward-backward-send-forward-backward-recv').stop()

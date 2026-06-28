@@ -1457,7 +1457,9 @@ def forward_backward_pipelining_with_interleaving(
     nvtx_range_push(suffix="warmup")
     input_tensors[0].append(
         p2p_communicator.recv_forward(
-            tensor_shape, _is_vp_first_stage(vp_stage=0) and is_pp_first_stage(pp_group)
+            tensor_shape,
+            _is_vp_first_stage(vp_stage=0) and is_pp_first_stage(pp_group),
+            vp_stage=0,
         )
     )
 
@@ -1518,6 +1520,7 @@ def forward_backward_pipelining_with_interleaving(
                     recv_prev=recv_prev,
                     tensor_shape=tensor_shape,
                     overlap_p2p_comm=True,
+                    recv_prev_vp_stage=next_forward_model_chunk_id,
                 )
             )
 
@@ -1562,12 +1565,17 @@ def forward_backward_pipelining_with_interleaving(
                         recv_prev=recv_prev,
                         recv_next=recv_next,
                         tensor_shape=tensor_shape,
+                        recv_prev_vp_stage=next_forward_model_chunk_id,
+                        recv_next_vp_stage=num_model_chunks - 1,
                     )
                 )
                 output_tensor_grads[num_model_chunks - 1].append(output_tensor_grad)
             else:
                 input_tensor = p2p_communicator.send_forward_recv_forward(
-                    output_tensor, recv_prev=recv_prev, tensor_shape=tensor_shape
+                    output_tensor,
+                    recv_prev=recv_prev,
+                    tensor_shape=tensor_shape,
+                    recv_prev_vp_stage=next_forward_model_chunk_id,
                 )
             if recv_prev:
                 input_tensors[next_forward_model_chunk_id].append(input_tensor)
@@ -1585,6 +1593,7 @@ def forward_backward_pipelining_with_interleaving(
                         recv_prev=recv_prev,
                         tensor_shape=tensor_shape,
                         overlap_p2p_comm=True,
+                        recv_prev_vp_stage=next_forward_model_chunk_id,
                     )
                 )
             if send_next_wait_handle is not None:
@@ -1620,6 +1629,7 @@ def forward_backward_pipelining_with_interleaving(
                         recv_next=recv_next,
                         tensor_shape=tensor_shape,
                         overlap_p2p_comm=True,
+                        recv_next_vp_stage=num_model_chunks - 1,
                     )
                 )
                 if send_prev_wait_handle is not None:
@@ -1724,6 +1734,7 @@ def forward_backward_pipelining_with_interleaving(
                         recv_prev=recv_prev,
                         tensor_shape=tensor_shape,
                         overlap_p2p_comm=True,
+                        recv_prev_vp_stage=next_forward_model_chunk_id,
                     )
                 )
                 if send_next_wait_handle is not None:
@@ -1787,6 +1798,7 @@ def forward_backward_pipelining_with_interleaving(
                         recv_next=recv_next,
                         tensor_shape=tensor_shape,
                         overlap_p2p_comm=True,
+                        recv_next_vp_stage=next_backward_model_chunk_id,
                     )
                 )
                 if send_prev_wait_handle is not None:
@@ -1863,6 +1875,8 @@ def forward_backward_pipelining_with_interleaving(
                     recv_prev=recv_prev,
                     recv_next=recv_next,
                     tensor_shape=tensor_shape,
+                    recv_prev_vp_stage=next_forward_model_chunk_id,
+                    recv_next_vp_stage=next_backward_model_chunk_id,
                 )
             )
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
@@ -1891,6 +1905,7 @@ def forward_backward_pipelining_with_interleaving(
                     is_last_stage=(
                         _is_vp_last_stage(vp_stage=curr_vp_stage) and is_pp_last_stage(pp_group)
                     ),
+                    vp_stage=curr_vp_stage,
                 )
             )
         for k in range(num_microbatches_remaining, total_num_microbatches):
@@ -1928,6 +1943,7 @@ def forward_backward_pipelining_with_interleaving(
                         recv_next=recv_next,
                         tensor_shape=tensor_shape,
                         overlap_p2p_comm=True,
+                        recv_next_vp_stage=next_backward_model_chunk_id,
                     )
                 )
 
@@ -1955,6 +1971,7 @@ def forward_backward_pipelining_with_interleaving(
                             recv_next=recv_next,
                             tensor_shape=tensor_shape,
                             overlap_p2p_comm=True,
+                            recv_next_vp_stage=next_backward_model_chunk_id,
                         )
                     )
 
@@ -1976,7 +1993,10 @@ def forward_backward_pipelining_with_interleaving(
 
             else:
                 output_tensor_grad = p2p_communicator.send_backward_recv_backward(
-                    input_tensor_grad, recv_next=recv_next, tensor_shape=tensor_shape
+                    input_tensor_grad,
+                    recv_next=recv_next,
+                    tensor_shape=tensor_shape,
+                    recv_next_vp_stage=next_backward_model_chunk_id,
                 )
 
                 if recv_next:
