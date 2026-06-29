@@ -210,7 +210,75 @@ class PipelineParallelLayerLayout:
         offset = self.get_layer_offset(layer_type=layer_type, vp_stage=vp_stage)
         num_layers_to_build = self.get_num_layers_to_build(layer_type=layer_type, vp_stage=vp_stage)
         return list(range(offset, offset + num_layers_to_build))
+    
+    def get_loss_stages(self):
+        """Return the loss stages in pipeline execution order.
+        Each entry is a tuple ``(pp_rank, vp_stage, loss_count)`` for every (pp_rank, vp_stage)
+        whose layout contains at least one ``LayerType.loss``. The order follows the pipeline
+        execution order (vpp-major, then pp), matching ``flatten_layout``.
+        """
+        loss_stages = []
+        for vpp_rank in range(self.virtual_pipeline_model_parallel_size):
+            for pp_rank in range(self.pipeline_model_parallel_size):
+                loss_count = self.layout[pp_rank][vpp_rank].count(LayerType.loss) + self.layout[pp_rank][vpp_rank].count(LayerType.mtp_loss)
+                if loss_count > 0:
+                    loss_stages.append((pp_rank, vpp_rank, loss_count))
+        return loss_stages
 
+    def is_loss_split(self) -> bool:
+        """Whether the loss computation is split across more than one pipeline stage."""
+        return len(self.get_loss_stages()) > 1
+
+    def get_loss_chunk_assignment(
+        self,
+        mtp_num_layers: Optional[int],
+        pp_rank: Optional[int] = None,
+        vp_stage: Optional[int] = None,
+    ):
+        """Resolve which hidden-state chunks a loss stage owns and whether it is the final stage.
+        The hidden states arriving at the loss stages are the concatenation
+        ``[main, mtp_0, ..., mtp_{mtp_num_layers-1}]`` along dim 0, i.e. ``N = 1 + mtp_num_layers``
+        chunks with index ``j`` requiring labels rolled ``j`` times (``j=0`` is the main model).
+        Assignment rule (see specs/mtp_loss_split.md §6): walk the loss stages in pipeline order
+        and hand the highest-index chunks to the earliest loss stage, peeling downward, so that
+        the final loss stage owns the low indices including chunk ``0`` (the main model).
+        Single-loss-stage layouts (legacy) own all chunks and are always the final stage.
+        Args:
+            mtp_num_layers: Number of MTP layers (``None``/0 means no MTP).
+            pp_rank: Pipeline rank to query. Defaults to the current rank.
+            vp_stage: Virtual pipeline stage to query. Defaults to 0 / current.
+        Returns:
+            Tuple ``(owned_indices, is_final_stage)``. ``owned_indices`` is the sorted list of
+            chunk indices this stage computes loss for; ``is_final_stage`` is True iff it owns
+            chunk 0 (the main model loss).
+        """
+        if pp_rank is None:
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        if vp_stage is None:
+            if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+                vp_stage = parallel_state.get_virtual_pipeline_model_parallel_rank()
+            else:
+                vp_stage = 0
+
+        num_chunks = 1 + (mtp_num_layers or 0)
+        loss_stages = self.get_loss_stages()
+
+        # Legacy single loss stage: it owns every chunk and is the final stage.
+        if len(loss_stages) <= 1:
+            return list(range(num_chunks)), True
+
+        # Split mode: assign high-index chunks to earlier loss stages, peeling downward.
+        hi = num_chunks - 1
+        assignment = {}
+        for pr, vs, loss_count in loss_stages:
+            assignment[(pr, vs)] = list(range(hi - loss_count + 1, hi + 1))
+            hi -= loss_count
+
+        owned = assignment.get((pp_rank, vp_stage), [])
+        is_final_stage = 0 in owned
+        
+        return owned, is_final_stage
+    
     def pretty_repr(self):
         """Pretty representation of the custom layout, showing the layers held by each stage.
         Example:

@@ -204,19 +204,42 @@ class LanguageModule(MegatronModule):
             self.shared_embedding_or_output_weight().shared_embedding = True
 
         if (
-            self.post_process
-            or getattr(self, 'mtp_process', False)
+            getattr(self, 'mtp_process', False)
             or getattr(self, 'mtp_loss_process', False)
         ) and not self.pre_process:
+            # L stage， M stage，m stage
             assert not (
                 is_vp_first_stage(self.vp_stage, self.vp_size) and is_pp_first_stage(self.pp_group)
             )
-            # set weights of the duplicated embedding to 0 here,
-            # then copy weights from pre processing stage using all_reduce below.
-            weight = self.shared_embedding_or_output_weight()
-            weight.data.fill_(0)
-            weight.shared = True
-            weight.shared_embedding = True
+            
+            def set_shared(weight, is_embedding = True):
+                weight.data.fill_(0)
+                weight.shared = True
+                if is_embedding:
+                    weight.shared_embedding = True
+                
+            if getattr(self, 'mtp_process', False):
+                if torch.distributed.get_rank() % 8 == 0:
+                    print(f"[sherry] Set mtp_block embedding shared!!")
+                set_shared(self.embedding.word_embeddings.weight)
+            if not self.post_process and getattr(self, 'mtp_loss_process', False):
+                if torch.distributed.get_rank() % 8 == 0:
+                    print(f"[sherry] Set mtp_loss output_layer shared!!")
+                set_shared(self.output_layer.weight, is_embedding=False)
+            
+            # if self.post_process and self.config.pipeline_model_parallel_layout.is_loss_split():
+            #     if torch.distributed.get_rank() % 8 == 0:
+            #         print(f"[sherry] Split last loss stage, not shared")
+            # else:
+            #     # set weights of the duplicated embedding to 0 here,
+            #     # then copy weights from pre processing stage using all_reduce below.
+            #     weight = self.shared_embedding_or_output_weight() # embedding or output_layer
+            #     weight.data.fill_(0)
+            #     weight.shared = True
+            #     weight.shared_embedding = True
+            #     if torch.distributed.get_rank() % 8 == 0:
+            #         print(f"Set weighe shared and shared_embedding = True in LanguageModule, weight={weight.shape}, self.post_process={self.post_process}, self.mtp_process={self.mtp_process}, self.mtp_loss_process = {self.mtp_loss_process}")
+            
 
         # Parameters are shared between the word embeddings layers, and the
         # heads at the end of the model. In a pipelined setup with more than
@@ -283,17 +306,35 @@ class LanguageModule(MegatronModule):
         first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
         output_layer_weight_key = f'{prefix}output_layer.weight'
         output_layer_bias_key = f'{prefix}output_layer.bias'
-
+        
+        # The output_layer also lives on non-final loss stages when the MTP loss is split, so
+        # apply the same checkpoint handling there (keeps the replicated output_layer.weight's
+        # sharded-tensor metadata consistent across all loss stages).
+        is_output_layer_stage = self.post_process or getattr(self, 'is_loss_stage', False) # include lm loss & mtp loss
         if self.share_embeddings_and_output_weights:
             self.tie_embeddings_and_output_weights_state_dict(
                 sharded_state_dict, output_layer_weight_key, first_stage_word_emb_key
             )
-        elif self.post_process:
+        elif is_output_layer_stage:
             # Make sure the output layer follows the embeddings padding logic
             sharded_state_dict[output_layer_weight_key].allow_shape_mismatch = True
+            # MTP loss split: the output_layer is replicated across loss stages. Give the
+            # non-final replica a distinct replica_id (PP-replica slot = 1, mirroring the tied
+            # word embedding) so dist-checkpoint treats it as a replica of the final stage's copy
+            # rather than a second writer for the same shard. The distributed-optimizer state
+            # inherits this replica_id from the model param, so this fixes both weight and optim.
+            if getattr(self, 'is_loss_stage', False) and not getattr(
+                self, 'is_final_loss_stage', True
+            ):
+                print(f"rank={torch.distributed.get_rank()}, set mtp loss replica_id!")
+                sharded_state_dict[output_layer_weight_key].replica_id = (
+                    1,
+                    0,
+                    parallel_state.get_data_parallel_rank(with_context_parallel=True),
+                )
 
         # Regardless of sharing the output weights with embeddings, we must handle the bias padding
-        if self.post_process and output_layer_bias_key in sharded_state_dict:
+        if is_output_layer_stage and output_layer_bias_key in sharded_state_dict:
             sharded_state_dict[output_layer_bias_key].allow_shape_mismatch = True
 
         return sharded_state_dict

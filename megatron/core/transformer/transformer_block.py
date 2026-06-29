@@ -276,6 +276,7 @@ class TransformerBlock(MegatronModule):
         post_process: bool = True,
         model_comm_pgs: ModelCommProcessGroups = None,
         vp_stage: Optional[int] = None,
+        enforce_final_layernorm = False
     ):
         super().__init__(config=config)
 
@@ -284,6 +285,7 @@ class TransformerBlock(MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.vp_stage = vp_stage
+        self.enforce_final_layernorm = enforce_final_layernorm
 
         # required for pipeline parallel schedules
         self.input_tensor = None
@@ -366,6 +368,7 @@ class TransformerBlock(MegatronModule):
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
         if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+        # if self.has_final_layernorm_in_this_stage():
             self.final_layernorm = build_module(
                 self.submodules.layer_norm,
                 config=self.config,
@@ -374,6 +377,42 @@ class TransformerBlock(MegatronModule):
             )
         else:
             self.final_layernorm = None  # Either this or nn.Identity
+            
+        if self.enforce_final_layernorm:
+            self.final_layernorm = build_module(
+                self.submodules.layer_norm,
+                config=self.config,
+                hidden_size=self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+            )
+            
+    def has_final_layernorm_in_this_stage(self):
+        """
+        Check if this vpp stage contains the final layernorm.
+        Note:
+            Final layernorm now has been moved from the post-process stage to the last decoder
+            layer by using this function.
+            There will be a small numeric difference because of grad norm reduction when final
+            layernorm is placed in different pipeline stages in deterministic mode. It can still
+            be bitwise aligned by disabling grad norm clipping.
+        """
+        if self.config.mtp_num_layers is None:
+            # for model without MTPLayer, the final layernorm is set in the stage which does
+            # post_process
+            return self.submodules.layer_norm and self.post_process and self.post_layer_norm
+        else:
+            # for model with MTPLayer, the final layernorm is set in the stage which has the
+            # last layer of the decoder
+            has_final_layernorm_in_this_stage = False
+            for layer in self.layers:
+                if layer.layer_number == self.config.num_layers:
+                    has_final_layernorm_in_this_stage = True
+                    break
+            return (
+                self.submodules.layer_norm
+                and has_final_layernorm_in_this_stage
+                and self.post_layer_norm
+            )
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]

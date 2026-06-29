@@ -28,6 +28,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import \
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.fp8_utils import is_float8tensor, dequantize_fp8_tensor
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core import parallel_state
 from .async_utils import schedule_async_save, is_empty_async_queue
 from .global_vars import get_args
 from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
@@ -1309,6 +1310,102 @@ def load_args_from_checkpoint(
 
     return args, checkpoint_args
 
+def get_attr_wrapped_model(m):
+        unwrapped = m
+        while hasattr(unwrapped, 'module'):
+            unwrapped = unwrapped.module
+        return unwrapped
+    
+def _get_main_grad_attr(param: torch.nn.Parameter, use_megatron_fsdp: bool = False):
+    if hasattr(param, "main_grad"):
+        return "main_grad"
+    return "grad"
+
+
+def _print_embedding_output_layer_stats(model, tag):
+    def _fmt_stat(name, tensor):
+        shared = getattr(tensor, 'shared', False)
+        shared_embedding = getattr(tensor, 'shared_embedding', False)
+        shared_output_layer = getattr(tensor, 'shared_output_layer', False)
+        t = tensor.detach().float()
+        return (
+            f"{name}: shape={list(t.shape)}, "
+            f"shared={shared}, "
+            f"shared_embedding={shared_embedding}, "
+            f"shared_output_layer={shared_output_layer}, "
+            f"min={t.min().item():.6f}, max={t.max().item():.6f}, "
+            f"mean={t.mean().item():.6f}, std={t.std().item():.6f}, "
+            f"norm={t.norm().item():.6f}"
+        )
+    
+    models = model if isinstance(model, list) else [model]
+    for i, m in enumerate(models):
+        unwrapped = m
+        while hasattr(unwrapped, 'module'):
+            unwrapped = unwrapped.module
+        # Unwrap DDP/Float16 wrappers via an attribute present on every GPTModel chunk.
+        # unwrapped = get_attr_wrapped_model(model_chunk)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank() if torch.distributed.is_initialized() else 0
+        tp_rank = parallel_state.get_tensor_model_parallel_rank() if torch.distributed.is_initialized() else 0
+        vpp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank() if torch.distributed.is_initialized() else 0
+
+        lines = []
+        lines.append(
+            f"[{tag}] rank={rank} pp_rank={pp_rank} vpp_rank={vpp_rank} tp_rank={tp_rank} model_idx={i}, "
+            f"pre_process={getattr(unwrapped, 'pre_process', None)} "
+            f"post_process={getattr(unwrapped, 'post_process', None)} "
+            f"mtp_process={getattr(unwrapped, 'mtp_process', None)} "
+            f"mtp_loss_process={getattr(unwrapped, 'mtp_loss_process', None)}"
+        )
+
+        if hasattr(unwrapped, 'embedding') and hasattr(unwrapped.embedding, 'word_embeddings'):
+            lines.append(_fmt_stat('embedding.word_embeddings.weight', unwrapped.embedding.word_embeddings.weight))
+            grad_attr = _get_main_grad_attr(unwrapped.embedding.word_embeddings.weight)
+            orig_grad = getattr(unwrapped.embedding.word_embeddings.weight, grad_attr)
+            lines.append(_fmt_stat(f'embedding.word_embeddings.weight.{grad_attr}', orig_grad))
+            
+        else:
+            lines.append('embedding.word_embeddings.weight: ABSENT')
+
+        if hasattr(unwrapped, 'output_layer') and getattr(unwrapped.output_layer, 'weight', None) is not None:
+            lines.append(_fmt_stat('output_layer.weight', unwrapped.output_layer.weight))
+            grad_attr = _get_main_grad_attr(unwrapped.output_layer.weight)
+            orig_grad = getattr(unwrapped.output_layer.weight, grad_attr)
+            lines.append(_fmt_stat(f'output_layer.weight.{grad_attr}', orig_grad))
+            
+        else:
+            lines.append('output_layer.weight: ABSENT')
+            
+        p_str = '\n'.join(lines) + '\n'
+        if torch.distributed.get_rank() % 8 == 0:
+            print(p_str, flush=True)
+        
+
+def _iter_all_optimizer_params(optimizer):
+    if optimizer is None:
+        return
+
+    # ChainedOptimizer: recursively walk sub-optimizers.
+    if hasattr(optimizer, 'chained_optimizers'):
+        for sub_optimizer in optimizer.chained_optimizers:
+            yield from _iter_all_optimizer_params(sub_optimizer)
+        return
+
+    # MegatronOptimizer / DistributedOptimizer wrappers.
+    base_optimizer = getattr(optimizer, 'optimizer', None)
+    if base_optimizer is not None and hasattr(base_optimizer, 'param_groups'):
+        for param_group in base_optimizer.param_groups:
+            for param in param_group['params']:
+                yield param
+        return
+
+    # Fallback: object itself exposes param_groups.
+    if hasattr(optimizer, 'param_groups'):
+        for param_group in optimizer.param_groups:
+            for param in param_group['params']:
+                yield param
+        return
 
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
                     checkpointing_context=None, skip_load_to_model_and_opt=False):
@@ -1597,6 +1694,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 
+    
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
         try:
@@ -1625,13 +1723,14 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     print_rank_0(f' checkpoint version {checkpoint_version}')
     fix_query_key_value_ordering(model, checkpoint_version)
 
+
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
             if not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
                 optimizer.load_state_dict(state_dict['optimizer'])
-                del state_dict['optimizer']
+                del state_dict['optimizer']                
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
@@ -1668,6 +1767,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optimizer.reload_model_params(state_dict=state_dict)
             else:
                 optimizer.reload_model_params()
+
 
     # rerun state
     if not ignore_rerun_state:

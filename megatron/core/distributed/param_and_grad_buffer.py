@@ -18,7 +18,7 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from ..fp8_utils import is_float8tensor, is_mxfp8tensor, modify_underlying_storage
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-
+from ..rerun_state_machine import _safe_get_rank
 logger = logging.getLogger(__name__)
 
 try:
@@ -182,6 +182,8 @@ class _ParamAndGradBucketGroup:
         for i in range(len(self.buckets)):
             grad_norm = self.buckets[i].grad_data.norm(p=2)
             # check for NaN, Inf and unexpectedly large grads
+            rank = _safe_get_rank()
+            # print(f"hh temp info: Rank {rank}, local buckets-{i} in iteration {rerun_state_machine.current_iteration} grad_norm={grad_norm}")
             if check_for_nan_or_inf:
                 rerun_state_machine.validate_result(
                     result=grad_norm,
@@ -621,7 +623,7 @@ class _ParamAndGradBuffer:
             the DP reduce-scatter to be before the embedding all-reduce.
             """
             return (
-                getattr(param, "shared_embedding", False)
+                (getattr(param, "shared_embedding", False) or getattr(param, "shared_output_layer", False))
                 and self.ddp_config.use_distributed_optimizer
             )
 

@@ -154,7 +154,20 @@ class MegatronOptimizer(ABC):
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
             if grad_not_none and is_not_shared and is_not_tp_duplicate:
                 grads_for_norm.append(grad)
-
+                
+            name = getattr(param, '_debug_name', 'UNKNOWN')
+            if 'output_layer.weight' in name:
+                if grad is None:
+                    grad_norm_value = None
+                    grad_mean_value = None
+                    grad_max_value = None
+                    param_norm = None
+                else:
+                    grad_float = grad.detach().float()
+                    grad_norm_value = grad_float.norm().item()
+                    grad_mean_value = grad_float.mean().item()
+                    grad_max_value = grad_float.abs().max().item()
+                    param_norm = param.norm().item()
         return grads_for_norm
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
@@ -205,7 +218,7 @@ class MegatronOptimizer(ABC):
             grads_for_norm = []
         grad_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
-        )
+        )            
 
         if params:
             clip_grad_by_total_norm_fp32(
@@ -635,6 +648,11 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                                 main_param.shared = param.shared
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param
+                            if hasattr(param, '_debug_name'):
+                                main_param._debug_name = param._debug_name
+                            if hasattr(param, '_debug_pp_rank'):
+                                main_param._debug_pp_rank = param._debug_pp_rank
+
 
                             # Store handle to main_param.
                             param.main_param = main_param

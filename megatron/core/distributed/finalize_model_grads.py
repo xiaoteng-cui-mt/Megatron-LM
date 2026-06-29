@@ -193,7 +193,8 @@ def _allreduce_word_embedding_grads(
             pp_group = parallel_state.get_pipeline_model_parallel_group()
 
     _allreduce_embedding_grad(
-        model, embd_group, pp_group, partial(_get_shared_word_embedding_weight, config=config)
+        model, embd_group, pp_group, partial(_get_shared_word_embedding_weight, config=config),
+        config=config,
     )
 
 
@@ -203,6 +204,7 @@ def _allreduce_embedding_grad(
     pp_group: torch.distributed.ProcessGroup,
     weight_getter: Callable[[torch.nn.Module], Optional[torch.nn.Parameter]],
     skip_if_none: bool = True,
+    config: TransformerConfig = None,
 ):
     """Unified helper to all-reduce embedding parameters across pipeline stages.
 
@@ -228,6 +230,9 @@ def _allreduce_embedding_grad(
         if is_pp_first_stage(pp_group):
             model_module = model[0]
         elif is_pp_last_stage(pp_group):
+            model_module = model[-1]
+        elif getattr(config, 'mtp_num_layers', None) is not None and config.mtp_num_layers > 0:
+            # Embedding for MTP layers is in the last virtual pipeline model parallel stage.
             model_module = model[-1]
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
@@ -265,6 +270,44 @@ def _allreduce_position_embedding_grads(
     _allreduce_embedding_grad(
         model, pos_emb_group, pp_group, _get_position_embedding_weight, skip_if_none=False
     )
+
+def _allreduce_output_layer_grads_across_loss_group(
+    model: List[torch.nn.Module], config: TransformerConfig
+):
+    """All-reduce output_layer grads across the loss group (MTP loss split).
+    When the loss is split across multiple pipeline stages (see specs/mtp_loss_split.md), every
+    loss stage holds a replica of the output_layer and computes loss only for its share of the
+    MTP/main chunks. Summing their gradients across the loss group reconstructs the gradient the
+    single (un-split) output_layer would have received, keeping the replicas identical after the
+    optimizer step.
+    """
+    loss_group = parallel_state.get_loss_group(check_initialized=False)
+    if loss_group is None or get_pg_size(loss_group) <= 1:
+        return
+    if torch.distributed.get_rank() not in torch.distributed.get_process_group_ranks(loss_group):
+        return
+
+    for model_chunk in model:
+        ddp_config = model_chunk.ddp_config
+        # Unwrap DDP/Float16 wrappers via an attribute present on every GPTModel chunk.
+        model_module = get_attr_wrapped_model(model_chunk, 'pre_process', return_model_obj=True)
+        if not getattr(model_module, 'is_loss_stage', False):
+            continue
+        output_layer = getattr(model_module, 'output_layer', None)
+        weight = getattr(output_layer, 'weight', None) if output_layer is not None else None
+        if weight is None:
+            continue
+
+        grad_attr = _get_main_grad_attr(weight)
+        orig_grad = getattr(weight, grad_attr)
+        if ddp_config.use_megatron_fsdp:
+            orig_grad = orig_grad._local_tensor if orig_grad is not None else None
+        grad = _unshard_if_dtensor(orig_grad)
+        if grad is None:
+            continue
+        
+        torch.distributed.all_reduce(grad, group=loss_group)
+        setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
 def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
@@ -414,7 +457,7 @@ def finalize_model_grads(
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-
+    
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
@@ -448,6 +491,10 @@ def finalize_model_grads(
         )
     _allreduce_word_embedding_grads(model, config, embd_group, pp_group)
     _allreduce_position_embedding_grads(model, config, pos_emb_group, pp_group)
+    _allreduce_output_layer_grads_across_loss_group(model, config)
+    
+    # All-reduce output_layer grads across the loss group (MTP loss split): keep the replicated
+    # output_layer on each loss stage in sync.
 
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()

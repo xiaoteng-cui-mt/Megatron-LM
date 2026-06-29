@@ -243,6 +243,15 @@ class MTPLossLoggingHelper:
         if "values" not in tracker:
             return
         values = tracker["values"]
+        # MTP loss split: each loss stage only filled the per-layer entries it owns. Sum across
+        # the loss group so every loss stage (including the logging stage) holds all per-layer
+        # MTP losses. Only loss-group members reach here (others have no tracker values), so this
+        # collective is symmetric. No-op for the default single-loss-stage case (group size 1).
+        loss_group = parallel_state.get_loss_group(check_initialized=False)
+        if loss_group is not None and torch.distributed.get_world_size(loss_group) > 1 and False:
+            # FIXME(sherry): Perform allreduce in the stages without LM loss
+            torch.distributed.all_reduce(values, group=loss_group)
+            
         # Reduce mtp losses across ranks.
         if tracker.get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
@@ -251,14 +260,24 @@ class MTPLossLoggingHelper:
                 values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
 
-    def track_mtp_metrics(loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None):
+    def track_mtp_metrics(
+        loss_scale,
+        iteration,
+        writer,
+        wandb_writer=None,
+        total_loss_dict=None,
+        log_to_stdout=False,
+        reduce_for_logging=True,
+    ):
         """Track the Multi-Token Prediction (MTP) metrics for logging."""
-        MTPLossLoggingHelper.reduce_loss_in_tracker()
+        if reduce_for_logging:
+            MTPLossLoggingHelper.reduce_loss_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
         if "values" not in tracker:
             return
         mtp_losses = tracker["values"] * loss_scale
         mtp_num_layers = mtp_losses.shape[0]
+        mtp_log_values = []
         for i in range(mtp_num_layers):
             name = f"mtp_{i+1} loss"
             loss = mtp_losses[i]
@@ -267,10 +286,21 @@ class MTPLossLoggingHelper:
                     total_loss_dict[name] += loss
                 else:
                     total_loss_dict[name] = loss
+            if log_to_stdout:
+                mtp_log_values.append(f'{name}: {loss.item():.6E}')
             if writer is not None:
                 writer.add_scalar(name, loss, iteration)
             if wandb_writer is not None:
                 wandb_writer.log({f"{name}": loss}, iteration)
+
+        if log_to_stdout and mtp_log_values:
+            if torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+                log_string = f'(rank {rank}) iteration {iteration:8d} | ' + ' | '.join(mtp_log_values) + ' |'
+            else:
+                log_string = f' iteration {iteration:8d} | ' + ' | '.join(mtp_log_values) + ' |'
+            if parallel_state.get_data_parallel_rank(with_context_parallel=True) == parallel_state.get_data_parallel_world_size() -1:
+                print(log_string, flush=True)
 
         MTPLossLoggingHelper.clean_loss_in_tracker()
 
@@ -414,6 +444,32 @@ def get_mtp_loss_ranks(pp_ranks: List[int], config: TransformerConfig) -> List[i
             if LayerType.mtp_loss in layout[pp_rank][vpp_rank]:
                 mtp_loss_ranks.add(pp_ranks[pp_rank])
     return list(mtp_loss_ranks)
+
+def loss_on_this_rank(
+    config: TransformerConfig, ignore_virtual: Optional[bool] = True, vp_stage: Optional[int] = None
+) -> bool:
+    """Check if there is a loss (output) layer on the current rank.
+    With a custom pipeline layout, any stage containing ``LayerType.loss`` is a loss stage
+    (and must build the output layer + run the loss path). Without a custom layout, only the
+    last pipeline stage is a loss stage.
+    """
+    if config.pipeline_model_parallel_layout is None:
+        return parallel_state.is_pipeline_last_stage(
+            ignore_virtual=ignore_virtual, vp_stage=vp_stage
+        )
+
+    layout = config.pipeline_model_parallel_layout.layout
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    if (
+        not ignore_virtual
+        and parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
+    ):
+        assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
+        return layout[pp_rank][vp_stage].count(LayerType.loss) > 0 or layout[pp_rank][vp_stage].count(LayerType.mtp_loss) > 0
+    return any(
+        stage.count(LayerType.loss) > 0 or stage.count(LayerType.mtp_loss) > 0 for stage in layout[pp_rank]
+    )
+    
 def get_mtp_ranks(pp_ranks: List[int], config: TransformerConfig) -> List[int]:
     """Get the ranks of the MTP layers."""
     mtp_ranks = set()
@@ -450,6 +506,12 @@ def get_mtp_num_layers_to_build(
     """Get the number of MTP layers to build."""
     if config.pipeline_model_parallel_layout is not None:
         # If we have a custom PP layout, get the number of mtp layers in the layout array.
+        # With MTP standalone the MTP layers may be split across several pipeline stages, so
+        # num_layers_to_build is whatever the layout assigns to this stage (no longer required
+        # to equal mtp_num_layers).
+        # With MTP standalone the MTP layers may be split across several pipeline stages, so
+        # num_layers_to_build is whatever the layout assigns to this stage (no longer required
+        # to equal mtp_num_layers).
         num_layers_to_build = config.pipeline_model_parallel_layout.get_num_layers_to_build(
             layer_type=LayerType.mtp, vp_stage=vp_stage
         )

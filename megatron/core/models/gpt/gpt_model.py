@@ -26,6 +26,7 @@ from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     mtp_loss_on_this_rank,
+    loss_on_this_rank,
     roll_tensor,
     tie_output_layer_state_dict,
     tie_word_embeddings_state_dict,
@@ -141,7 +142,24 @@ class GPTModel(LanguageModule):
         self.mtp_loss_process = mtp_loss_on_this_rank(
             config, ignore_virtual=False, vp_stage=vp_stage
         )
-
+        # Loss-stage resolution (MTP loss split, see specs/mtp_loss_split.md).
+        # A "loss stage" is any pipeline stage that owns one or more output+loss computations.
+        # With a custom layout the loss may be split across multiple stages; otherwise the loss
+        # stage is exactly the last pipeline stage (== post_process). `is_final_loss_stage` is the
+        # stage that owns chunk 0 (the main model) and therefore produces the main logits/loss.
+        self.is_loss_stage = loss_on_this_rank(
+            self.config, ignore_virtual=False, vp_stage=vp_stage
+        ) # mtp_loss & lm loss
+        if self.config.pipeline_model_parallel_layout is not None and self.is_loss_stage:
+            self.loss_chunk_indices, self.is_final_loss_stage = (
+                self.config.pipeline_model_parallel_layout.get_loss_chunk_assignment(
+                    self.config.mtp_num_layers, vp_stage=vp_stage
+                )
+            )
+        else:
+            self.loss_chunk_indices = None
+            self.is_final_loss_stage = self.post_process
+        
         if self.pre_process or self.mtp_process:
             self.embedding = LanguageModelEmbedding(
                 config=self.config,
@@ -181,14 +199,26 @@ class GPTModel(LanguageModule):
         # Cache for RoPE tensors which do not change between iterations.
         self.rotary_pos_emb_cache = {}
 
-        # Transformer.
+        # Transformer.                
+        post_layer_norm = True
+        enforce_final_layernorm = False
+        if self.config.pipeline_model_parallel_layout.is_loss_split():
+            if self.mtp_process:
+                # FIXME(sherry)： Determine if it’s the first layer of MTP
+                enforce_final_layernorm = True
+            else:
+                enforce_final_layernorm = False
+                post_layer_norm = False
+                
         self.decoder = TransformerBlock(
             config=self.config,
             spec=transformer_layer_spec,
+            post_layer_norm = post_layer_norm,
             pre_process=self.pre_process,
             post_process=self.post_process,
             model_comm_pgs=self.model_comm_pgs,
             vp_stage=vp_stage,
+            enforce_final_layernorm = enforce_final_layernorm,
         )
 
         if self.mtp_process:
@@ -197,7 +227,10 @@ class GPTModel(LanguageModule):
             )
 
         # Output
-        if self.post_process or self.mtp_loss_process:
+        # Output. Build the output layer on every loss stage (not just the last PP stage): with
+        # MTP loss split, non-final loss stages also need the output projection to compute their
+        # share of the logits/loss.
+        if self.post_process or self.is_loss_stage:
 
             if self.config.defer_embedding_wgrad_compute:
                 # The embedding activation buffer preserves a reference to the input activations
@@ -229,8 +262,26 @@ class GPTModel(LanguageModule):
                 tp_group=self.model_comm_pgs.tp,
             )
 
-        if self.pre_process or self.post_process or self.mtp_process or self.mtp_loss_process:
+        if self.pre_process or self.post_process or self.mtp_process or self.is_loss_stage:
             self.setup_embeddings_and_output_layer()
+
+        # When the loss is split across multiple pipeline stages, the output_layer is replicated
+        # on each loss stage. Make the replicas identical at init by all-reducing from the final
+        # loss stage so every stage projects logits with the same weights.
+        self._sync_output_layer_across_loss_group()
+
+        # Give the replicated output_layer its own grad bucket (like the tied word embedding) so
+        # its distributed-optimizer sharding is identical across loss stages — required for a
+        # consistent distributed checkpoint. Set on every loss stage so all replicas align.
+        if (
+            self.is_loss_stage
+            and self.config.pipeline_model_parallel_layout is not None
+            and self.config.pipeline_model_parallel_layout.is_loss_split()
+            and getattr(self, 'output_layer', None) is not None
+            and self.output_layer.weight is not None
+        ):
+            self.output_layer.weight.shared_output_layer = True
+            
 
         if has_config_logger_enabled(self.config):
             log_config_to_disk(
@@ -239,8 +290,42 @@ class GPTModel(LanguageModule):
         for name, module in self.named_modules():
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
-                module.finish_init(quant_config)
+                module.finish_init(quant_config)\
 
+    def _sync_output_layer_across_loss_group(self) -> None:
+        """Make the replicated output_layer weights identical across split-loss stages.
+
+        With MTP loss split the output_layer is built on every loss stage. To keep them a single
+        logical weight, the non-final loss stages zero their freshly-initialized copy and the
+        whole loss group all-reduces, leaving every stage holding the final loss stage's weights.
+        The per-step gradient all-reduce that keeps them in sync lives in finalize_model_grads
+        (Step D-2). No-op for the default single-loss-stage case (loss group of size 1).
+        """
+        if not getattr(self, 'is_loss_stage', False):
+            return
+
+        layout = self.config.pipeline_model_parallel_layout
+        if layout is None or not layout.is_loss_split():
+            return
+        if not torch.distributed.is_initialized() or self.config.init_model_with_meta_device:
+            return
+        loss_group = parallel_state.get_loss_group(check_initialized=False)
+        if loss_group is None or torch.distributed.get_world_size(loss_group) <= 1:
+            return
+        weight = self.output_layer.weight
+        if weight is None:
+            return
+        if not self.is_final_loss_stage:
+            with torch.no_grad():
+                weight.data.zero_()
+            # Mark the non-final replica as shared so grad-norm / param-norm count this logical
+            # weight only once (on the final loss stage), mirroring tied word-embedding handling.
+            # The gradient itself is still synced across the loss group and updated on every copy.
+            print(f"rank={torch.distributed.get_rank()}, set shared in _sync_output_layer_across_loss_group!")
+            weight.shared = True
+        weight.data = weight.data.cuda()
+        torch.distributed.all_reduce(weight.data, group=loss_group)
+        
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
 
@@ -443,6 +528,7 @@ class GPTModel(LanguageModule):
             )
             mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
             mtp_loss = loss_mask * mtp_loss
+            # print(f"rank={torch.distributed.get_rank()} mtp_loss={mtp_loss.norm()}")
             if self.training:
                 # TODO(shifangx): remove the use of parallel_state here
                 # after moving loss logging to loss_func in pretrain_gpt.py
