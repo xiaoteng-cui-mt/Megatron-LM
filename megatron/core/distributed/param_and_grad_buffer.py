@@ -182,7 +182,7 @@ class _ParamAndGradBucketGroup:
         for i in range(len(self.buckets)):
             grad_norm = self.buckets[i].grad_data.norm(p=2)
             # check for NaN, Inf and unexpectedly large grads
-            rank = _safe_get_rank()
+            # rank = _safe_get_rank()
             # print(f"hh temp info: Rank {rank}, local buckets-{i} in iteration {rerun_state_machine.current_iteration} grad_norm={grad_norm}")
             if check_for_nan_or_inf:
                 rerun_state_machine.validate_result(

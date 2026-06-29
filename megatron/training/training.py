@@ -83,7 +83,11 @@ from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
-from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.transformer.multi_token_prediction import (
+    MTPLossLoggingHelper,
+    mtp_loss_on_this_rank,
+    mtp_on_this_rank,
+)
 from megatron.core.parallel_state import destroy_global_memory_buffer, destroy_model_parallel
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
@@ -125,6 +129,73 @@ from . import ft_integration
 stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+
+
+def _unwrap_model_chunk(model_chunk):
+    while hasattr(model_chunk, 'module'):
+        model_chunk = model_chunk.module
+    return model_chunk
+
+
+def _needs_data_iterator_on_this_rank(model_chunk):
+    model_chunk = _unwrap_model_chunk(model_chunk)
+    model_config = getattr(model_chunk, 'config', None)
+    vp_stage = getattr(model_chunk, 'vp_stage', None)
+    has_mtp = (
+        model_config is not None
+        and getattr(model_config, 'mtp_num_layers', None) is not None
+        and mtp_on_this_rank(model_config, ignore_virtual=False, vp_stage=vp_stage)
+    )
+    has_mtp_loss = model_config is not None and mtp_loss_on_this_rank(
+        model_config, ignore_virtual=False, vp_stage=vp_stage
+    )
+
+    return (
+        mpu.is_pipeline_first_stage()
+        or mpu.is_pipeline_last_stage()
+        or has_mtp
+        or has_mtp_loss
+    )
+
+
+def _wrap_data_iterator_dataset_provider(build_train_valid_test_datasets_provider, model_chunk):
+    """Limit dataset construction to ranks that will actually consume data."""
+
+    should_build_dataset = (
+        _needs_data_iterator_on_this_rank(model_chunk)
+        and mpu.get_tensor_model_parallel_rank() == 0
+    )
+    provider_globals = getattr(build_train_valid_test_datasets_provider, '__globals__', {})
+    original_is_dataset_built_on_rank = provider_globals.get('is_dataset_built_on_rank', None)
+
+    if original_is_dataset_built_on_rank is None:
+        return build_train_valid_test_datasets_provider
+
+    def is_dataset_built_on_this_rank():
+        return should_build_dataset
+
+    @functools.wraps(build_train_valid_test_datasets_provider)
+    def wrapped_provider(*args, **kwargs):
+        provider_globals['is_dataset_built_on_rank'] = is_dataset_built_on_this_rank
+        try:
+            return build_train_valid_test_datasets_provider(*args, **kwargs)
+        finally:
+            provider_globals['is_dataset_built_on_rank'] = original_is_dataset_built_on_rank
+
+    wrapped_provider.is_distributed = getattr(
+        build_train_valid_test_datasets_provider, 'is_distributed', False
+    )
+    return wrapped_provider
+
+
+def _initialize_train_valid_test_flags():
+    args = get_args()
+    if not hasattr(args, 'do_train'):
+        args.do_train = args.train_iters > 0
+    if not hasattr(args, 'do_valid'):
+        args.do_valid = args.full_validation or args.eval_iters > 0
+    if not hasattr(args, 'do_test'):
+        args.do_test = args.full_validation or args.eval_iters > 0
 
 
 def destroy_global_state():
@@ -661,18 +732,23 @@ def pretrain(
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
+    _initialize_train_valid_test_flags()
     if args.virtual_pipeline_model_parallel_size is not None:
         train_data_iterator = []
         valid_data_iterator = []
         test_data_iterator = []
         for i in range(len(model)):
-            iterators = build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+            iterators = build_train_valid_test_data_iterators(
+                _wrap_data_iterator_dataset_provider(train_valid_test_dataset_provider, model[i])
+            )
             train_data_iterator.append(iterators[0])
             valid_data_iterator.append(iterators[1])
             test_data_iterator.append(iterators[2])
     else:
         train_data_iterator, valid_data_iterator, test_data_iterator = (
-            build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+            build_train_valid_test_data_iterators(
+                _wrap_data_iterator_dataset_provider(train_valid_test_dataset_provider, model[0])
+            )
         )
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
@@ -1183,10 +1259,14 @@ def dummy_train_step(data_iterator):
     num_microbatches = get_num_microbatches()
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        data_iterators = data_iterator if isinstance(data_iterator, list) else [data_iterator]
         for _ in range(num_microbatches):
-            # Re-use methods used in get_batch() from pretrain_{gpt, mamba}.py.
-            batch = get_batch_on_this_tp_rank(data_iterator)
-            batch = get_batch_on_this_cp_rank(batch)
+            for iterator in data_iterators:
+                if iterator is None:
+                    continue
+                # Re-use methods used in get_batch() from pretrain_{gpt, mamba}.py.
+                batch = get_batch_on_this_tp_rank(iterator)
+                batch = get_batch_on_this_cp_rank(batch)
 
 
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func):
@@ -2597,6 +2677,9 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     args = get_args()
 
     (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
+    data_flags_initialized = all(
+        hasattr(args, attr) for attr in ('do_train', 'do_valid', 'do_test')
+    )
 
     print_rank_0('> building train, validation, and test datasets ...')
 
@@ -2651,11 +2734,15 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     else:
         flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
 
-    torch.distributed.broadcast(flags, 0)
-
-    args.do_train = getattr(args, "do_train", False) or flags[0].item()
-    args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
-    args.do_test = getattr(args, "do_test", False) or flags[2].item()
+    if data_flags_initialized:
+        args.do_train = args.do_train or flags[0].item()
+        args.do_valid = args.do_valid or flags[1].item()
+        args.do_test = args.do_test or flags[2].item()
+    else:
+        torch.distributed.broadcast(flags, 0)
+        args.do_train = getattr(args, "do_train", False) or flags[0].item()
+        args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
+        args.do_test = getattr(args, "do_test", False) or flags[2].item()
 
     return train_dataloader, valid_dataloaders, test_dataloader
 
