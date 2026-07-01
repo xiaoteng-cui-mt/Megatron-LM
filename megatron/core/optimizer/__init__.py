@@ -91,7 +91,6 @@ def _get_param_groups(
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
-            param._debug_name = name
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
 

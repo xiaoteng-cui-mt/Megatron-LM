@@ -202,7 +202,7 @@ class GPTModel(LanguageModule):
         # Transformer.                
         post_layer_norm = True
         enforce_final_layernorm = False
-        if self.config.pipeline_model_parallel_layout.is_loss_split():
+        if self.config.pipeline_model_parallel_layout is not None and self.config.pipeline_model_parallel_layout.is_loss_split():
             if self.mtp_process:
                 # FIXME(sherry)： Determine if it’s the first layer of MTP
                 enforce_final_layernorm = True
