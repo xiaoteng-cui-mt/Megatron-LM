@@ -668,6 +668,16 @@ class TransformerConfig(ModelParallelConfig):
     pre_offload_moe_fused_swiglu_input = True
     """patch for verl"""
 
+    @property
+    def swap_moe_fc1_and_fused_swiglu_input_offload_timing(self):
+        """Whether to swap MoE fc1 and fused swiglu input offload timing."""
+        return bool(
+            self.offload_moe_fc1_input
+            and self.offload_moe_fused_swiglu_input
+            and self.pre_offload_moe_fused_swiglu_input
+            and self.fp8
+        )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more

@@ -190,8 +190,13 @@ class MoELayer(BaseMoELayer):
         experts.
         """
         if self.config.offload_moe_fused_swiglu_input and self.config.pre_offload_moe_fused_swiglu_input:
-            get_fine_grained_offload_handler().wait_offload('moe_fused_swiglu_input')
-            hidden_states = LaunchReloadFunction.apply(hidden_states, 'moe_fused_swiglu_input')
+            offload_tensor_name = (
+                'moe_fc1_input'
+                if self.config.swap_moe_fc1_and_fused_swiglu_input_offload_timing
+                else 'moe_fused_swiglu_input'
+            )
+            get_fine_grained_offload_handler().wait_offload(offload_tensor_name)
+            hidden_states = LaunchReloadFunction.apply(hidden_states, offload_tensor_name)
             
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
@@ -206,10 +211,13 @@ class MoELayer(BaseMoELayer):
         it is also applied. The output from the experts is preprocessed for the
         combine step.
         """
-        if self.config.offload_moe_fc1_input:
+        swap_offload_timing = self.config.swap_moe_fc1_and_fused_swiglu_input_offload_timing
+        if self.config.offload_moe_fc1_input and not swap_offload_timing:
             get_fine_grained_offload_handler().launch_offload('moe_fc1_input')
             hidden_states = WaitReloadFunction.apply(hidden_states, 'moe_fc1_input')
-        if self.config.offload_moe_fused_swiglu_input and not self.config.pre_offload_moe_fused_swiglu_input:
+        if self.config.offload_moe_fused_swiglu_input and (
+            not self.config.pre_offload_moe_fused_swiglu_input or swap_offload_timing
+        ):
             get_fine_grained_offload_handler().launch_offload('moe_fused_swiglu_input')
             hidden_states = WaitReloadFunction.apply(hidden_states, 'moe_fused_swiglu_input')
         
@@ -238,10 +246,12 @@ class MoELayer(BaseMoELayer):
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
         
-        if self.config.offload_moe_fc1_input:
+        if self.config.offload_moe_fc1_input and not swap_offload_timing:
             get_fine_grained_offload_handler().wait_offload('moe_fc1_input')
             output = LaunchReloadFunction.apply(output, 'moe_fc1_input')
-        if self.config.offload_moe_fused_swiglu_input and not self.config.pre_offload_moe_fused_swiglu_input:
+        if self.config.offload_moe_fused_swiglu_input and (
+            not self.config.pre_offload_moe_fused_swiglu_input or swap_offload_timing
+        ):
             get_fine_grained_offload_handler().wait_offload('moe_fused_swiglu_input')
             output = LaunchReloadFunction.apply(output, 'moe_fused_swiglu_input')
 

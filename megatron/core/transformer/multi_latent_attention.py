@@ -208,8 +208,13 @@ class MultiLatentAttention(Attention):
         inference_params=None,
     ):
         if self.config.offload_moe_fused_swiglu_input and self.config.pre_offload_moe_fused_swiglu_input:
-            get_fine_grained_offload_handler().launch_offload('moe_fused_swiglu_input')
-            hidden_states = WaitReloadFunction.apply(hidden_states, 'moe_fused_swiglu_input')
+            offload_tensor_name = (
+                'moe_fc1_input'
+                if self.config.swap_moe_fc1_and_fused_swiglu_input_offload_timing
+                else 'moe_fused_swiglu_input'
+            )
+            get_fine_grained_offload_handler().launch_offload(offload_tensor_name)
+            hidden_states = WaitReloadFunction.apply(hidden_states, offload_tensor_name)
             
         """Forward pass for multi-latent attention"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
