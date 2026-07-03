@@ -222,9 +222,15 @@ class _ParamAndGradBucketGroup:
                     )
                 bucket = self.buckets[i]
                 stable_bucket_desc = f"bucket_id={bucket.buffer_tag}-{bucket.bucket_id}-{i}"
-                if grad_norm.item() > 1:
+                if (
+                    int(os.getenv("PRINT_GRAD_NORM_LOCAL_LOSS", 0)) == 1
+                    and (
+                        torch.isnan(grad_norm).item()
+                        or grad_norm.item() >= float(os.getenv("PRINT_GRAD_NORM_THRESHOLD", 5))
+                    )
+                ):
                     print(
-                        f"grad norm info: {stable_bucket_desc}, iteration={rerun_state_machine.current_iteration}, grad_norm={grad_norm.item()}"
+                        f"[grad norm info] {stable_bucket_desc}, iteration={rerun_state_machine.current_iteration}, grad_norm={grad_norm.item()}"
                     )
                 rerun_state_machine.validate_result(
                     result=grad_norm,

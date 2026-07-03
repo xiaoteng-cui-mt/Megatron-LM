@@ -280,6 +280,7 @@ class DistributedDataParallel(_BaseDataParallel):
             # Allocate the grad buffers and map the grads.
             buffers = []
             for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
+                typed_buffer_tag = f"{buffer_tag}({param_dtype})({grad_dtype})"
                 buffers.append(
                     _ParamAndGradBuffer(
                         self.ddp_config,
@@ -292,7 +293,7 @@ class DistributedDataParallel(_BaseDataParallel):
                         gradient_scaling_factor,
                         param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)],
                         self.ddp_config.nccl_ub,
-                        buffer_tag,
+                        typed_buffer_tag,
                     )
                 )
 
