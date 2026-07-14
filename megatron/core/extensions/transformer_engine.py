@@ -61,6 +61,12 @@ except ImportError:
     HAVE_TE = False
 
 
+def override_tensor_model_parallel_partition_attributes(tensor, dim, stride):
+    """Sets or overwrites TP attributes on a tensor."""
+    setattr(tensor, "partition_dim", dim)
+    setattr(tensor, "partition_stride", stride)
+
+
 def _get_extra_te_kwargs(config: TransformerConfig):
     extra_transformer_engine_kwargs = {"params_dtype": config.params_dtype}
 
@@ -362,6 +368,10 @@ class TELinear(te.pytorch.Linear):
             parallel_mode=te_parallel_mode,
             **extra_kwargs,
         )
+
+        if parallel_mode == "duplicated":
+            for weight in self.weight_names:
+                setattr(getattr(self, weight), "tensor_model_parallel", False)
 
         for param in self.parameters():
             if is_expert:
@@ -667,6 +677,7 @@ class TEColumnParallelLinear(TELinear):
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
+        override_tensor_model_parallel_partition_attributes(self.weight, dim=0, stride=1)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
@@ -761,6 +772,7 @@ class TERowParallelLinear(TELinear):
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
                 setattr(self.bias, "sequence_parallel", config.sequence_parallel)
+        override_tensor_model_parallel_partition_attributes(self.weight, dim=1, stride=1)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""
