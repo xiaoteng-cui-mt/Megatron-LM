@@ -135,6 +135,7 @@ _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 _GLOBAL_MEMORY_BUFFER = None
 
 _DECODER_RANK_GENERATOR = None
+_DISTRIBUTED_TIMEOUT_MINUTES = 30
 
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
@@ -630,6 +631,9 @@ def initialize_model_parallel(
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
     """
+    global _DISTRIBUTED_TIMEOUT_MINUTES
+    _DISTRIBUTED_TIMEOUT_MINUTES = distributed_timeout_minutes
+
     # NCCL restricts IB SHARP usage to a single communicator group—the first one created
     # with NCCL_COLLNET_ENABLE=1. After this group is created, NCCL_COLLNET_ENABLE must be
     # set to 0 for subsequent groups.
@@ -1282,11 +1286,15 @@ def initialize_model_parallel(
     _set_global_memory_buffer()
 
 
-def initialize_mooncake_pp_group():
+def initialize_mooncake_pp_group(distributed_timeout_minutes: Optional[int] = None):
     global _DECODER_RANK_GENERATOR
     global _PIPELINE_MODEL_PARALLEL_GROUP_MOONCAKE
+    global _DISTRIBUTED_TIMEOUT_MINUTES
 
     from mooncake import pg
+
+    if distributed_timeout_minutes is None:
+        distributed_timeout_minutes = _DISTRIBUTED_TIMEOUT_MINUTES
 
     host_ip = os.getenv('NODE_ADDR')
     assert host_ip is not None
@@ -1314,7 +1322,6 @@ def initialize_mooncake_pp_group():
 
     torch.musa.set_device(local_rank)
 
-    distributed_timeout_minutes = 30
     timeout = timedelta(minutes=distributed_timeout_minutes)
 
     pipe_line_global_ranks = None
