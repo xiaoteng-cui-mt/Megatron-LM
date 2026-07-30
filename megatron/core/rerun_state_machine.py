@@ -122,6 +122,7 @@ class RerunValidationStatus(str, Enum):
     FIRST_RERUN_REPRODUCIBLE = "first_rerun_reproducible"
     SECOND_RERUN_NOT_REPRODUCIBLE = "second_rerun_not_reproducible"
     SECOND_RERUN_REPRODUCIBLE = "second_rerun_reproducible"
+    FIRST_RERUN_UNEXPECTED_VALIDATION = "first_rerun_unexpected_validation"
     SECOND_RERUN_UNEXPECTED_VALIDATION = "second_rerun_unexpected_validation"
 
 
@@ -208,8 +209,10 @@ class RerunStateMachine:
         # Request to restart job again from checkpoint because got the same GPU (3rd+ re-run).
         self.restart_again_requested: bool = False
         # Request to resume normal execution when no HW fault was detected.
+        # If multiple ranks requested a rerun, normal execution can resume only after every
+        # rerun-requesting rank also requests to continue.
         self.continue_requested: bool = False
-        # Set when a second rerun fails at a different validation call than the initial failure.
+        # Set when a rerun fails at a different validation call than the initial failure.
         # This is all-reduced before continue_requested so that any rank can block continuing.
         self.unexpected_validation_failed_during_rerun: bool = False
         self.continue_on_transient_error: bool = continue_on_transient_error
@@ -217,8 +220,8 @@ class RerunStateMachine:
 
         self.error_injector: RerunErrorInjector = error_injector or RerunErrorInjector()
         self.validation_counts: dict[Caller, int] = defaultdict(int)
-        self.failed_validation_call: Optional[Call] = None
-        self.initial_result: Any = None
+        self.failed_validation_calls: dict[Call, Any] = {}
+        self.failed_validation_continue_decisions: dict[Call, bool] = {}
         self.suspicious_node: str = None
         self.suspicious_device: int = None
 
@@ -310,8 +313,8 @@ class RerunStateMachine:
             self.restart_again_requested = False
             self.continue_requested = False
             self.unexpected_validation_failed_during_rerun = False
-            self.failed_validation_call = None
-            self.initial_result = None
+            self.failed_validation_calls = {}
+            self.failed_validation_continue_decisions = {}
             self.suspicious_node = None
             self.suspicious_device = None
             self.injected_result = None
@@ -332,6 +335,8 @@ class RerunStateMachine:
                 return False
             if self.mode == RerunMode.VALIDATE_RESULTS and _safe_get_rank() == 0:
                 logger.warning("Need to rerun step to check reproducibility of initial result")
+            self.failed_validation_continue_decisions = {}
+            self.continue_requested = False
             self.state = RerunState.RERUNNING_IN_PLACE
             self._restore_state()
             if data_iterators:
@@ -347,18 +352,25 @@ class RerunStateMachine:
                 self._maybe_report_stats()
                 self.saved_results = defaultdict(list)
                 return False
-            will_continue_tensor: torch.Tensor = torch.tensor(
-                [self.continue_requested], dtype=torch.int32, device="cuda"
+            fail_rerun: torch.Tensor = torch.tensor(
+                [self.unexpected_validation_failed_during_rerun], dtype=torch.int32, device="cuda"
             )
-            torch.distributed.all_reduce(will_continue_tensor)
-            if will_continue_tensor.item() > 0:
+            torch.distributed.all_reduce(fail_rerun)
+            self._update_continue_requested_from_failed_validations()
+            if (
+                fail_rerun.item() == 0
+                and self._all_rerun_requesting_ranks_requested_continue()
+            ):
                 if _safe_get_rank() == 0:
                     logger.warning(
-                        "Continuing normal execution because failed validation was not reproduced"
+                        "Continuing normal execution because all rerun-requesting ranks requested to continue"
                     )
                 self.state = RerunState.NOT_RUNNING_YET
                 return False
-
+            if _safe_get_rank() == 0:
+                logger.warning(
+                    "Stop normal execution since validation call is fatal, a new validation failed during rerun, or not all rerun-requesting ranks requested to continue"
+                )
             # checkpoint_requested is not a good name as both cases creating checkpoints
             will_checkpoint_tensor: torch.Tensor = torch.tensor(
                 [self.checkpoint_requested], dtype=torch.int32, device="cuda"
@@ -376,6 +388,9 @@ class RerunStateMachine:
         # Are we about to re-run from a checkpoint?
         elif self.state in [RerunState.WILL_RERUN_FROM_CHECKPOINT,
                             RerunState.WILL_VERIFY_TRANSIENT_FROM_CHECKPOINT]:
+            self.failed_validation_continue_decisions = {}
+            self.continue_requested = False
+            self.unexpected_validation_failed_during_rerun = False
             self.state = RerunState.RERUNNING_FROM_CHECKPOINT
             return True
         # Are we done re-running from a checkpoint?
@@ -392,13 +407,13 @@ class RerunStateMachine:
                     )
                 self.state = RerunState.RERUNNING_AGAIN_FROM_CHECKPOINT
             else:
-                will_fail_rerun_tensor: torch.Tensor = torch.tensor(
+                fail_rerun: torch.Tensor = torch.tensor(
                     [self.unexpected_validation_failed_during_rerun],
                     dtype=torch.int32,
                     device="cuda",
                 )
-                torch.distributed.all_reduce(will_fail_rerun_tensor)
-                if will_fail_rerun_tensor.item() > 0:
+                torch.distributed.all_reduce(fail_rerun)
+                if fail_rerun.item() > 0:
                     if _safe_get_rank() == 0:
                         logger.error(
                             "Failing validation because a different validation call failed during "
@@ -406,18 +421,47 @@ class RerunStateMachine:
                         )
                     self.continue_requested = False
                     return False
-                will_continue_tensor: torch.Tensor = torch.tensor(
-                    [self.continue_requested], dtype=torch.int32, device="cuda"
-                )
-                torch.distributed.all_reduce(will_continue_tensor)
-                if will_continue_tensor.item() > 0:
+                self._update_continue_requested_from_failed_validations()
+                if self._all_rerun_requesting_ranks_requested_continue():
                     if _safe_get_rank() == 0:
                         logger.warning(
                             "Continuing normal execution because failed validation was not fatal or continue on transient error has been enabled"
                         )
                     self.state = RerunState.NOT_RUNNING_YET
+                else:
+                    if _safe_get_rank() == 0:
+                        logger.warning("Not all ranks passed rerun validation, therefore exit training")
             return False
         raise RuntimeError("Should not be here")
+
+    def _update_continue_requested_from_failed_validations(self) -> None:
+        """Update whether this rank can continue after rerun validation."""
+
+        if not self.rerun_requested:
+            self.continue_requested = False
+            return
+        if self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
+            self.continue_requested = bool(self.failed_validation_calls) and all(
+                self.failed_validation_continue_decisions.values()
+            )
+            return
+        self.continue_requested = bool(self.failed_validation_calls) and all(
+            self.failed_validation_continue_decisions.get(call, False)
+            for call in self.failed_validation_calls
+        )
+
+    def _all_rerun_requesting_ranks_requested_continue(self) -> bool:
+        """Return true only if every rank that requested rerun also requested continue."""
+
+        continue_and_rerun_tensor: torch.Tensor = torch.tensor(
+            [self.continue_requested, self.rerun_requested], dtype=torch.int32, device="cuda"
+        )
+        torch.distributed.all_reduce(continue_and_rerun_tensor)
+        continue_count, rerun_count = continue_and_rerun_tensor.tolist()
+        if continue_count != rerun_count and _safe_get_rank() == 0:
+            logger.error(f"Rerun requested ranks: {rerun_count} != Continue requested ranks: {continue_count}")
+        logger.warning(f"Rerun requested ranks: {rerun_count}, Continue requested ranks: {continue_count}")
+        return rerun_count > 0 and continue_count == rerun_count
 
     def should_checkpoint_and_exit(self) -> Tuple[bool, bool, int]:
         """Method instructing whether to checkpoint and/or abort the job.
@@ -595,8 +639,7 @@ class RerunStateMachine:
 
         # If this the initial run of the iteration, and no unexpected result has already been
         # identified?
-        if self.state == RerunState.INITIAL_RUN and not self.rerun_requested:
-
+        if self.state == RerunState.INITIAL_RUN:
             # Do not validate results on the first iteration, as we cannot guarantee a checkpoint
             # can be taken before the optimizer has been stepped at least once.
             if not self.first_iteration_complete:
@@ -604,8 +647,7 @@ class RerunStateMachine:
 
             result_rejected: bool = self.error_injector.maybe_inject() or rejection_func(result)
             if result_rejected:
-                self.failed_validation_call = validation_call
-                self.initial_result = result
+                self.failed_validation_calls[validation_call] = result
                 self.rerun_requested = True
                 self._log_validation_error_to_file(
                     status=RerunValidationStatus.INITIAL_RUN, result=result, message=message
@@ -617,63 +659,52 @@ class RerunStateMachine:
                     f"invokation #{validation_call.sequence} "
                     f"(message='{message}')"
                 )
-        # If this is a rerun, keep checking other validation calls as well. A failure at a
-        # different validation call cannot be compared to the initial failure, but it should not
-        # be silently ignored.
-        elif (
-            self.state == RerunState.RERUNNING_FROM_CHECKPOINT
-            and validation_call != self.failed_validation_call
-        ):
-            result_rejected: bool = rejection_func(result)
-            if result_rejected:
-                self.unexpected_validation_failed_during_rerun = True
-                self.continue_requested = False
-                original_failed_sequence = (
-                    self.failed_validation_call.sequence
-                    if self.failed_validation_call is not None
-                    else "unknown"
+        elif self.state == RerunState.RERUNNING_IN_PLACE:
+            if validation_call not in self.failed_validation_calls:
+                result_rejected: bool = rejection_func(result)
+                if result_rejected:
+                    self.unexpected_validation_failed_during_rerun = True
+                    self.continue_requested = False
+                    self._log_validation_error_to_file(
+                        status=RerunValidationStatus.FIRST_RERUN_UNEXPECTED_VALIDATION,
+                        result=result,
+                        message=message,
+                    )
+                    logger.error(
+                        f"Unexpected result during first rerun: {result} "
+                        f"on rank {_safe_get_rank()} "
+                        f"at iteration #{self.current_iteration} "
+                        f"invokation #{validation_call.sequence} "
+                        f"(message='{message}')"
+                    )
+            else:
+                # Re-run the rejection function for logging side effects, such as bucket module
+                # dumps from grad norm validation, even though the decision below is based on
+                # comparing against the initial failed result.
+                rejection_func(result)
+                initial_result = self.failed_validation_calls[validation_call]
+                comparison: float = self.error_injector.maybe_miscompare(
+                    comparison_func, initial_result, result, self.state
                 )
-                self._log_validation_error_to_file(
-                    status=RerunValidationStatus.SECOND_RERUN_UNEXPECTED_VALIDATION,
-                    result=result,
-                    message=message,
-                )
-                logger.error(
-                    f"Unexpected result {result} "
-                    f"on rank {_safe_get_rank()} "
-                    f"at iteration #{self.current_iteration} "
-                    f"invokation #{validation_call.sequence} "
-                    f"(message='{message}'); original failed invokation was "
-                    f"#{original_failed_sequence}"
-                )
-        # If this is the first rerun (same GPU) or second rerun (different GPU), and have we
-        # reached the validation call that failed during the initial run?
-        elif (
-            self.state in [RerunState.RERUNNING_IN_PLACE, RerunState.RERUNNING_FROM_CHECKPOINT]
-            and validation_call == self.failed_validation_call
-        ):
-            comparison: float = self.error_injector.maybe_miscompare(
-                comparison_func, self.initial_result, result, self.state
-            )
-            # This is the first re-run.
-            if self.state == RerunState.RERUNNING_IN_PLACE:
                 if comparison > tolerance:
-                    logger.warning(
+                    logger.error(
                         "First rerun: unexpected result is not reproducible within the tolerance "
-                        f"({result} != {self.initial_result})"
+                        f"({result} != {initial_result})"
                     )
                     self._log_validation_error_to_file(
                         status=RerunValidationStatus.FIRST_RERUN_NOT_REPRODUCIBLE,
                         result=result,
                         message=message,
                     )
+                    self.failed_validation_continue_decisions[validation_call] = False
                     log_failure("Possible transient error!")
                 else:
-                    self.checkpoint_requested = True
-                    # Remember the node and device we're running on so that we can check we're not
-                    # rerunning on the same GPU when we resume from the checkpoint.
-                    self.suspicious_node = os.uname()[1]
-                    self.suspicious_device = torch.cuda.current_device()
+                    if fatal:
+                        self.checkpoint_requested = True
+                        # Remember the node and device we're running on so that we can check we're not
+                        # rerunning on the same GPU when we resume from the checkpoint.
+                        self.suspicious_node = os.uname()[1]
+                        self.suspicious_device = torch.cuda.current_device()
                     self._log_validation_error_to_file(
                         status=RerunValidationStatus.FIRST_RERUN_REPRODUCIBLE,
                         result=result,
@@ -681,14 +712,42 @@ class RerunStateMachine:
                     )
                     logger.warning(
                         "First rerun: unexpected result is reproducible within the tolerance "
-                        f"({result} = {self.initial_result}). "
-                        "Need to rerun on a different GPU to verify correctness"
+                        f"({result} = {initial_result})."
                     )
-            # This is the second re-run.
-            elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
+                    if fatal:
+                        self.failed_validation_continue_decisions[validation_call] = False
+                        logger.warning(
+                            f"[rank {_safe_get_rank()}] Fatal validation failure, set to not continue training."
+                        )
+                    else:
+                        self.failed_validation_continue_decisions[validation_call] = True
+
+        elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
+            if validation_call not in self.failed_validation_calls:
+                result_rejected: bool = rejection_func(result)
+                if result_rejected:
+                    self.unexpected_validation_failed_during_rerun = True
+                    self.continue_requested = False
+                    self._log_validation_error_to_file(
+                        status=RerunValidationStatus.SECOND_RERUN_UNEXPECTED_VALIDATION,
+                        result=result,
+                        message=message,
+                    )
+                    logger.error(
+                        f"Unexpected result during second rerun: {result} "
+                        f"on rank {_safe_get_rank()} "
+                        f"at iteration #{self.current_iteration} "
+                        f"invokation #{validation_call.sequence} "
+                        f"(message='{message}')"
+                    )
+            else:
+                initial_result = self.failed_validation_calls[validation_call]
+                result_rejected: bool = rejection_func(result)
+                comparison: float = self.error_injector.maybe_miscompare(
+                    comparison_func, initial_result, result, self.state
+                )
                 # Continue training if rerunning value is valid, overwrite fatal argument
                 if self.continue_on_transient_error:
-                    result_rejected: bool = rejection_func(result)
                     if not result_rejected:
                         self._log_validation_error_to_file(
                             status=RerunValidationStatus.SECOND_RERUN_NOT_REPRODUCIBLE,
@@ -698,31 +757,31 @@ class RerunStateMachine:
                         logger.warning(
                             "Second rerun: failed validation is no longer reproduced after "
                             "loading from checkpoint, therefore continuing normal execution "
-                            f"({result} != {self.initial_result})"
+                            f"({result} != {initial_result})"
                         )
-                        if not self.unexpected_validation_failed_during_rerun:
-                            self.continue_requested = True
+                        self.failed_validation_continue_decisions[validation_call] = True
                         return
 
                 # Ensure we're not on the same GPU as the first rerun.
                 node: str = os.uname()[1]
                 device: int = torch.cuda.current_device()
-                if node == self.suspicious_node and device == self.suspicious_device:
-                    logger.error(
-                        f"Got rescheduled on the same GPU. Need to resume again from the same "
-                        f"checkpoint (node: {self.suspicious_node}, gpu: {self.suspicious_device})"
-                    )
-                    self.restart_again_requested = True
-                elif comparison > tolerance:
+                # if node == self.suspicious_node and device == self.suspicious_device:
+                #     logger.error(
+                #         f"Got rescheduled on the same GPU. Need to resume again from the same "
+                #         f"checkpoint (node: {self.suspicious_node}, gpu: {self.suspicious_device})"
+                #     )
+                #     self.restart_again_requested = True
+                if comparison > tolerance:
                     self._log_validation_error_to_file(
                         status=RerunValidationStatus.SECOND_RERUN_NOT_REPRODUCIBLE,
                         result=result,
                         message=message,
                     )
-                    logger.warning(
-                        "Second rerun: unexpected result is not reproducible on a different GPU, "
-                        f"therefore was likely incorrect ({result} != {self.initial_result})"
+                    logger.error(
+                        f"Second rerun [rank {_safe_get_rank()}]: unexpected result is not reproducible on a different GPU, "
+                        f"therefore was likely incorrect ({result} != {initial_result})"
                     )
+                    self.failed_validation_continue_decisions[validation_call] = False
                     log_failure("Possible persistent error!")
                 else:
                     self._log_validation_error_to_file(
@@ -731,14 +790,20 @@ class RerunStateMachine:
                         message=message,
                     )
                     logger.warning(
-                        "Second rerun: unexpected result is reproducible on a different GPU, "
-                        f"therefore it was likely correct ({result} = {self.initial_result})"
+                        f"Second rerun [rank {_safe_get_rank()}]: unexpected result is reproducible on a different GPU, "
+                        f"therefore it was likely correct ({result} = {initial_result})"
                     )
                     log_failure(f"Correct result (but possible Application error) ({message})")
-                    if not fatal and not self.unexpected_validation_failed_during_rerun:
-                        self.continue_requested = True
-            else:
-                raise RuntimeError("Should not be here")
+                    if fatal:
+                        self.failed_validation_continue_decisions[validation_call] = False
+                        logger.warning(
+                            f"[rank {_safe_get_rank()}] Fatal validation failure, set to not continue training."
+                        )
+                    else:
+                        self.failed_validation_continue_decisions[validation_call] = True
+                        logger.warning(
+                            f"[rank {_safe_get_rank()}] Non fatal validation failure, set to continue training."
+                        )
 
     def is_unexpectedly_large(
         self,
@@ -861,8 +926,7 @@ class RerunStateMachine:
             # logged_sdc_enabled should not be saved (set at the job startup time).
             "error_injector_checkpoint": self.error_injector.state_dict(),
             # validation_counts should not be saved (reset at start of training loop).
-            "failed_validation_call": self.failed_validation_call,
-            "initial_result": self.initial_result,
+            "failed_validation_calls": self.failed_validation_calls,
             "suspicious_node": self.suspicious_node,
             "suspicious_device": self.suspicious_device,
             # No need to save saved_state (RNG state  already captured in checkpoint).
@@ -944,8 +1008,13 @@ class RerunStateMachine:
         self.restart_again_requested = sharded_dict["restart_again_requested"]
         self.continue_requested = sharded_dict["continue_requested"]
         self.error_injector.load_state_dict(sharded_dict["error_injector_checkpoint"])
-        self.failed_validation_call = sharded_dict["failed_validation_call"]
-        self.initial_result = sharded_dict["initial_result"]
+        self.failed_validation_calls = sharded_dict.get("failed_validation_calls", {})
+        if not self.failed_validation_calls:
+            failed_validation_call = sharded_dict.get("failed_validation_call")
+            initial_result = sharded_dict.get("initial_result")
+            if failed_validation_call is not None:
+                self.failed_validation_calls = {failed_validation_call: initial_result}
+        self.failed_validation_continue_decisions = {}
         self.suspicious_node = sharded_dict["suspicious_node"]
         self.suspicious_device = sharded_dict["suspicious_device"]
         self.data_iterator_checkpoints = sharded_dict["data_iterator_checkpoints"]

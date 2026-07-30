@@ -3,6 +3,7 @@
 import logging
 from contextlib import contextmanager
 from typing import Optional
+import os
 
 import torch
 
@@ -18,6 +19,29 @@ from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 
 logger = logging.getLogger(__name__)
+
+def _short_dtype_name(dtype):
+    dtype_to_short_name = {
+        torch.float32: "fp32",
+        torch.float: "fp32",
+        torch.bfloat16: "bf16",
+        torch.float16: "fp16",
+        torch.half: "fp16",
+        torch.int8: "int8",
+        torch.uint8: "uint8",
+        torch.int16: "int16",
+        torch.short: "int16",
+        torch.int32: "int32",
+        torch.int: "int32",
+        torch.int64: "int64",
+        torch.long: "int64",
+    }
+    if hasattr(torch, "float8_e4m3fn"):
+        dtype_to_short_name[torch.float8_e4m3fn] = "fp8"
+    if hasattr(torch, "float8_e5m2"):
+        dtype_to_short_name[torch.float8_e5m2] = "fp8"
+    return dtype_to_short_name.get(dtype, str(dtype))
+
 
 
 class DistributedDataParallel(_BaseDataParallel):
@@ -54,6 +78,8 @@ class DistributedDataParallel(_BaseDataParallel):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
         self.module = module
+
+        self.model_chunk_id = getattr(module, "model_chunk_id", None)
 
         # If bucket_size is not provided as an input, use sane default.
         # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
@@ -280,7 +306,13 @@ class DistributedDataParallel(_BaseDataParallel):
             # Allocate the grad buffers and map the grads.
             buffers = []
             for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
-                typed_buffer_tag = f"{buffer_tag}({param_dtype})({grad_dtype})"
+                buffer_tag_suffix = (
+                    "" if self.model_chunk_id is None else f"_chunk{self.model_chunk_id}"
+                )
+                typed_buffer_tag = (
+                    f"{buffer_tag}{buffer_tag_suffix}"
+                    f"-{_short_dtype_name(param_dtype)}-{_short_dtype_name(grad_dtype)}"
+                )
                 buffers.append(
                     _ParamAndGradBuffer(
                         self.ddp_config,
@@ -377,7 +409,7 @@ class DistributedDataParallel(_BaseDataParallel):
             dense_params,
             self.intra_dp_cp_group,
             gradient_scaling_factor=gradient_scaling_factor,
-            buffer_tag="buffer_dense",
+            buffer_tag="dpcp",
         )
 
         # Allocate separate param+grad buffers for expert parallel params' grads.
@@ -386,7 +418,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 expert_parallel_params,
                 self.intra_expt_dp_group,
                 gradient_scaling_factor=expert_gradient_scaling_factor,
-                buffer_tag="buffer_ep",
+                buffer_tag="edp",
             )
         )
 
@@ -611,7 +643,10 @@ class DistributedDataParallel(_BaseDataParallel):
         communication ops.
         """
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
-            bucket_group.finish_grad_sync()
+            if int(os.getenv("PRINT_GRAD_NORM_LOCAL_LOSS", 0)) == 1:
+                bucket_group.finish_grad_sync(self)
+            else:
+                bucket_group.finish_grad_sync()
 
     def scale_gradients(self, scaling_factor: float):
         """Scale all gradients inside the buffers by `scaling_factor`."""

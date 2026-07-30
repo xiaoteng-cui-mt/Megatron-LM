@@ -991,6 +991,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
         config = get_model_config(model[0])
 
+        for model_chunk_idx, model_chunk in enumerate(model):
+            setattr(model_chunk, "model_chunk_id", model_chunk_idx)
+
         if getattr(args, "use_torch_fsdp2", False):
             reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
             ddp_config = TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)

@@ -5,7 +5,7 @@ from typing import Callable, List, Optional, Union
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-
+import os
 try:
     from torch.distributed._tensor import DTensor, distribute_tensor
 
@@ -461,7 +461,9 @@ def finalize_model_grads(
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
-    for model_chunk in model:
+    for i, model_chunk in enumerate(model):
+        if int(os.getenv("PRINT_GRAD_NORM_LOCAL_LOSS", 0)) == 1 and not hasattr(model_chunk, "model_chunk_id"):
+            setattr(model_chunk, "model_chunk_id", i)
         model_chunk.finish_grad_sync()
     if config.timers is not None:
         config.timers('all-grads-sync').stop()

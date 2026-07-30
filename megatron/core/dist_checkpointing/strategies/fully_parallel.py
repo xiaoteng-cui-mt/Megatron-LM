@@ -113,6 +113,14 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         Returns: None
         """
         start = time()
+        has_rerun_state = _has_rerun_state_machine_sharded_object(sharded_state_dict)
+         # HACK(wuwei): Invalid cache if rerun state machine is not None (rerun checkpoint)
+        if self.do_cache_distribution and has_rerun_state:
+            if self.cached_distribution is not None:
+                logger.debug('Invalidating cached save distribution for rerun state structure')
+            self.cached_distribution = None
+            _invalidate_cached_ckpt_structure(self.base_strategy)
+
         if self.do_cache_distribution and self.cached_distribution is not None:
             logger.debug(f'Apply *cached* save parallelization')
             precomputed_distribution = self.cached_distribution
@@ -128,7 +136,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         if self.cached_distribution is None:
             # First time applying the parallelization
             validate_sharding_integrity(determine_global_metadata(sharded_state_dict)[1])
-        if self.do_cache_distribution:
+        if self.do_cache_distribution and not has_rerun_state:
             self.cached_distribution = precomputed_distribution
         end = time()
         logger.debug(f"parallel save sharding, time: {end - start}")
@@ -460,6 +468,19 @@ def distribute_main_replicas_with_precomputed_distribution(
             sh_ten.replica_id = 0
         else:
             sh_ten.replica_id = 1
+
+
+def _has_rerun_state_machine_sharded_object(sharded_state_dict: ShardedStateDict) -> bool:
+    rerun_state = sharded_state_dict.get('rerun_state_machine')
+    if not rerun_state:
+        return False
+    return any(isinstance(value, ShardedObject) for value in nested_values(rerun_state))
+
+
+def _invalidate_cached_ckpt_structure(strategy: SaveShardedStrategy) -> None:
+    invalidate = getattr(strategy, 'invalidate_cached_ckpt_structure', None)
+    if invalidate is not None:
+        invalidate()
 
 
 def _defer_loading_sharded_items(

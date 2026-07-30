@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 
 import torch
 from torch.distributed import _coalescing_manager
+from megatron.core import parallel_state
 
 import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -46,6 +47,79 @@ class BufferType(Enum):
 
     PARAM = 1
     GRAD = 2
+
+def get_attr_wrapped_model(m):
+    unwrapped = m
+    while hasattr(unwrapped, 'module'):
+        unwrapped = unwrapped.module
+    return unwrapped
+
+
+def _get_main_grad_attr(param: torch.nn.Parameter, use_megatron_fsdp: bool = False):
+    if hasattr(param, "main_grad"):
+        return "main_grad"
+    return "grad"
+
+
+def _format_grad_stat(name, tensor, norm=None):
+    if norm is None:
+        norm = tensor.detach().float().norm().item()
+    return f"{name}: shape={list(tensor.shape)}, norm={norm:.6f}"
+
+
+def _get_grad_log_context(rerun_state_machine=None):
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    pp_rank = (
+        parallel_state.get_pipeline_model_parallel_rank()
+        if torch.distributed.is_initialized()
+        else 0
+    )
+    dp_rank = (
+        parallel_state.get_data_parallel_rank()
+        if torch.distributed.is_initialized()
+        else 0
+    )
+    iteration = getattr(rerun_state_machine, "current_iteration", -1)
+    rerun_state = getattr(rerun_state_machine, "state", None)
+    rerun_state_name = getattr(rerun_state, "name", str(rerun_state))
+    run = {
+        "RERUNNING_IN_PLACE": "first_rerun",
+        "RERUNNING_FROM_CHECKPOINT": "sec_rerun",
+        "RERUNNING_AGAIN_FROM_CHECKPOINT": "sec_rerun",
+    }.get(rerun_state_name, "initial")
+    return rank, dp_rank, pp_rank, iteration, run
+
+
+def _format_grad_log_context(rerun_state_machine=None):
+    rank, dp_rank, pp_rank, iteration, run = _get_grad_log_context(rerun_state_machine)
+    return f"rank={rank} dp={dp_rank} pp={pp_rank} iteration={iteration} run={run}"
+
+
+def _print_bucket_parameters_stats(bucket, tag, force_print=False, log_context=None):
+    grad_norm_threshold = float(os.getenv("PRINT_MODULE_GRAD_NORM_THRESHOLD", 5))
+    bucket_desc = f"{bucket.buffer_tag}-{bucket.bucket_id}"
+    log_context = log_context or _format_grad_log_context()
+    tag_ = f"[{tag}, {bucket_desc}] {log_context}, "
+
+    named_params = [(bucket.param_to_name.get(param, "<unnamed>"), param) for param in bucket.params_list]
+    named_params.sort(key=lambda item: item[0])
+
+    lines = [tag_ + f"Total bucket parameters: {len(named_params)}"]
+    for name, param in named_params:
+        grad_attr = _get_main_grad_attr(param)
+        if hasattr(param, grad_attr):
+            grad_tensor = getattr(param, grad_attr)
+            if grad_tensor is not None:
+                grad_norm = grad_tensor.detach().float().norm().item()
+                if force_print or grad_norm >= grad_norm_threshold:
+                    lines.append(tag_ + _format_grad_stat(f"{name}.{grad_attr}", grad_tensor, grad_norm))
+            else:
+                lines.append(tag_ + f"{name}.{grad_attr}: None")
+        else:
+            lines.append(tag_ + f"{name}.{grad_attr}: ABSENT")
+
+    if len(lines) > 1:
+        print('\n'.join(lines) + '\n', flush=True)
 
 
 def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
@@ -87,6 +161,7 @@ class _ParamAndGradBucket:
         gradient_scaling_factor: float,
         bucket_id: int,
         buffer_tag: str,
+        param_to_name: Dict[torch.nn.Parameter, str],
     ):
         self.params_list = params
         self.params = set(params)
@@ -101,6 +176,7 @@ class _ParamAndGradBucket:
         self.gradient_scaling_factor = gradient_scaling_factor
         self.bucket_id = bucket_id
         self.buffer_tag = buffer_tag
+        self.param_to_name = {param: param_to_name.get(param, "<unnamed>") for param in params}
         self.param_to_index = {}
         offset = 0
         for param in params:
@@ -177,35 +253,58 @@ class _ParamAndGradBucketGroup:
         self.params_with_grad = set()
         self.is_last_microbatch = True
 
-    def check_grads(self, check_for_nan_or_inf, check_for_large):
+    def check_grads(self, check_for_nan_or_inf, check_for_large, model:torch.nn.Module=None):
         """
         Make sure norm of grads in bucket are not NaN prior to data-parallel
         all-reduce / reduce-scatter.
         """
         rerun_state_machine = get_rerun_state_machine()
+
+        # give 5% tolerance buffer for non-deterministic FA backward
+        grad_norm_rerun_tolerance = float(os.getenv("MEGATRON_GRAD_NORM_RERUN_TOLERANCE", 0.05))
+
         for i in range(len(self.buckets)):
-            grad_norm = self.buckets[i].grad_data.norm(p=2)
+            bucket = self.buckets[i]
+            stable_bucket_desc = f"{bucket.buffer_tag}-{bucket.bucket_id}-{i}"
+            log_context = _format_grad_log_context(rerun_state_machine)
+            grad_norm = bucket.grad_data.norm(p=2)
             # check for NaN, Inf and unexpectedly large grads
-            # rank = _safe_get_rank()
-            # print(f"hh temp info: Rank {rank}, local buckets-{i} in iteration {rerun_state_machine.current_iteration} grad_norm={grad_norm}")
+            def wrap_rejection_func(func, *args, **kwargs):
+                """包装 rejection function，在返回 False 时打印参数统计"""
+                def wrapped(result):
+                    is_reject = func(result, *args, **kwargs)
+                    if is_reject:
+                        _print_bucket_parameters_stats(
+                            bucket,
+                            "grad norm module info rejected",
+                            force_print=True,
+                            log_context=log_context,
+                        )
+                        # if os.environ.get("ENABLE_HOOK", "0") == "1":
+                        #     import musa_patch.debug_tools as debug_tools
+                        #     debug_tools.global_debug_hook_manager.save()
+                    return is_reject
+                return wrapped
+            
             if check_for_nan_or_inf:
                 rerun_state_machine.validate_result(
                     result=grad_norm,
-                    rejection_func=torch.isnan,
-                    message=f"found NaN in local grad norm for bucket #{i} "
+                    rejection_func=wrap_rejection_func(torch.isnan),
+                    message=f"found NaN in local grad norm for {stable_bucket_desc} "
                     f"in backward pass before data-parallel communication collective",
-                    tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
+                    tolerance=grad_norm_rerun_tolerance,
                     fatal=True,
                 )
                 rerun_state_machine.validate_result(
                     result=grad_norm,
-                    rejection_func=torch.isinf,
-                    message=f"found Inf in local grad norm for bucket #{i} "
+                    rejection_func=wrap_rejection_func(torch.isinf),
+                    message=f"found Inf in local grad norm for {stable_bucket_desc} "
                     f"in backward pass before data-parallel communication collective",
-                    tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
+                    tolerance=grad_norm_rerun_tolerance,
                     fatal=True,
                 )
             if check_for_large:
+                grad_norm_value = grad_norm.item()
                 large_grad_norm_threshold = os.getenv("MEGATRON_LARGE_GRAD_NORM_THRESHOLD")
                 try:
                     large_grad_norm_threshold = float(large_grad_norm_threshold)
@@ -220,26 +319,33 @@ class _ParamAndGradBucketGroup:
                     large_grad_norm_rejection_func = partial(
                         rerun_state_machine.is_unexpectedly_large, threshold=10, context="grads"
                     )
-                bucket = self.buckets[i]
-                stable_bucket_desc = f"bucket_id={bucket.buffer_tag}-{bucket.bucket_id}-{i}"
-                if (
-                    int(os.getenv("PRINT_GRAD_NORM_LOCAL_LOSS", 0)) == 1
-                    and (
-                        torch.isnan(grad_norm).item()
-                        or grad_norm.item() >= float(os.getenv("PRINT_GRAD_NORM_THRESHOLD", 5))
+                if int(os.getenv("PRINT_GRAD_NORM_LOCAL_LOSS", 0)) == 1:
+                    if (
+                        math.isnan(grad_norm_value)
+                        or grad_norm_value >= float(os.getenv("PRINT_GRAD_NORM_THRESHOLD", 5))
+                    ):
+                        print(
+                            f"[grad norm bucket info, {stable_bucket_desc}] "
+                            f"{log_context}, "
+                            f"grad_norm={grad_norm_value}",
+                            flush=True
+                        )
+                        _print_bucket_parameters_stats(
+                            bucket, "grad norm module info", log_context=log_context
+                        )
+                        # if os.environ.get("ENABLE_HOOK", "0") == "1":
+                        #         import musa_patch.debug_tools as debug_tools
+                        #         debug_tools.global_debug_hook_manager.save()
+
+                if not int(os.getenv("DISABLE_LARGE_GRAD_CHECK", 0)):
+                    rerun_state_machine.validate_result(
+                        result=grad_norm,
+                        rejection_func=wrap_rejection_func(large_grad_norm_rejection_func),
+                        message=f"found unexpected large grads in {stable_bucket_desc} "
+                        f"in backward pass before data-parallel communication collective",
+                        tolerance=grad_norm_rerun_tolerance,
+                        fatal=False,
                     )
-                ):
-                    print(
-                        f"[grad norm info] {stable_bucket_desc}, iteration={rerun_state_machine.current_iteration}, grad_norm={grad_norm.item()}"
-                    )
-                rerun_state_machine.validate_result(
-                    result=grad_norm,
-                    rejection_func=large_grad_norm_rejection_func,
-                    message=f"found unexpected large grads in {stable_bucket_desc} "
-                    f"in backward pass before data-parallel communication collective",
-                    tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
-                    fatal=False,
-                )
 
     def start_param_sync(self, force_sync: bool = False):
         """
@@ -350,7 +456,7 @@ class _ParamAndGradBucketGroup:
                     # it would clear the data of those param buffers that have not yet completed AG.
                     bucket.param_data.zero_()
 
-    def start_grad_sync(self):
+    def start_grad_sync(self, model=None):
         """
         Initiates grad sync (all-reduce or reduce-scatter) communication operations
         for all buckets in the bucket group.
@@ -367,6 +473,7 @@ class _ParamAndGradBucketGroup:
             self.check_grads(
                 check_for_nan_or_inf=self.ddp_config.check_for_nan_in_grad,
                 check_for_large=self.ddp_config.check_for_large_grads,
+                model=model
             )
 
         # gradient_scaling_factor already takes into account whether we are computing
@@ -474,7 +581,7 @@ class _ParamAndGradBucketGroup:
             # None.
             self.grad_reduce_handle = None
 
-    def finish_grad_sync(self):
+    def finish_grad_sync(self, model=None):
         """
         Finishes grad sync (all-reduce or reduce-scatter) communication operations
         for all buckets in the bucket group.
@@ -486,7 +593,7 @@ class _ParamAndGradBucketGroup:
         self.param_gather_dispatched = False
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
-            self.start_grad_sync()
+            self.start_grad_sync(model)
             return
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
@@ -561,6 +668,7 @@ class _ParamAndGradBuffer:
         self.params = params
         self.param_indices = param_indices
         self.buffer_tag = buffer_tag
+        self.param_to_name = param_to_name
 
         # Check that params are unique.
         unique_params = set()
@@ -879,6 +987,7 @@ class _ParamAndGradBuffer:
             gradient_scaling_factor=self.gradient_scaling_factor,
             bucket_id=bucket_id,
             buffer_tag=self.buffer_tag,
+            param_to_name=self.param_to_name,
         )
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket

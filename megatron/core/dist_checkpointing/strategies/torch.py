@@ -699,6 +699,14 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         self.validated_loaded_metadata_reuse = False
 
+    def invalidate_cached_ckpt_structure(self) -> None:
+        """Invalidate cached save plans and metadata for the next checkpoint save."""
+        self.cached_central_plan = None
+        self.cached_local_plan = None
+        self.cached_global_metadata = None
+        self.validated_cache_reuse = False
+        self.validated_loaded_metadata_reuse = False
+
     def async_save(
         self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
     ) -> AsyncRequest:
