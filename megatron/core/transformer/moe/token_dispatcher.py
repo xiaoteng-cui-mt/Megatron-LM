@@ -1022,6 +1022,7 @@ class _DeepepManager(_DispatchManager):
         hidden_states: torch.Tensor,
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
+        cur_chunk_id = None
     ) -> torch.Tensor:
         # DeepEP only supports float32 probs
         if self.token_probs.dtype != torch.float32:
@@ -1038,6 +1039,7 @@ class _DeepepManager(_DispatchManager):
                 async_finish=async_finish,
                 allocate_on_comm_stream=allocate_on_comm_stream,
                 overlap_moe_expert_parallel_comm=self.config.overlap_moe_expert_parallel_comm,
+                cur_chunk_id = cur_chunk_id
             )
         )
         self.handle = handle
@@ -1092,6 +1094,7 @@ class _DeepepManager(_DispatchManager):
         hidden_states: torch.Tensor,
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
+        cur_chunk_id = None
     ) -> torch.Tensor:
         hidden_states, _ = fused_combine(
             hidden_states,
@@ -1100,6 +1103,7 @@ class _DeepepManager(_DispatchManager):
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
             overlap_moe_expert_parallel_comm=self.config.overlap_moe_expert_parallel_comm,
+            cur_chunk_id = cur_chunk_id
         )
         # Release the handle after combine operation
         self.handle = None
@@ -1283,6 +1287,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         probs: torch.Tensor = None,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
+        cur_chunk_id = None
     ):
         """
         Execute fused permutation and AlltoAll communication.
@@ -1304,7 +1309,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
         dispatched_hidden_states = self._comm_manager.dispatch(
-            hidden_states, async_finish, allocate_on_comm_stream
+            hidden_states, async_finish, allocate_on_comm_stream, cur_chunk_id=cur_chunk_id
         )
         if self.shared_experts is not None:
             self.shared_experts.pre_forward_comm(hidden_states, wait_current_stream=False)
@@ -1357,6 +1362,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         hidden_states: torch.Tensor,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
+        cur_chunk_id = None
     ):
         """Executes fused un-permutation and communication using DeepEP kernels.
 
@@ -1374,7 +1380,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
-        return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
+        return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream, cur_chunk_id = cur_chunk_id)
 
     def combine_postprocess(self, hidden_states: torch.Tensor):
         """

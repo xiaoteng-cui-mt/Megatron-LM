@@ -113,6 +113,7 @@ def initialize_megatron(
         ),
         result_rejected_tracker_filename=args.result_rejected_tracker_filename,
         continue_on_transient_error=args.train_continue_on_transient_error,
+        continue_on_first_rerun_if_valid=args.continue_on_first_rerun_if_valid,
     )
 
     # torch.distributed initialization

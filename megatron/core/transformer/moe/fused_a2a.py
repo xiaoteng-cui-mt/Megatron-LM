@@ -17,7 +17,8 @@ import torch
 
 _buffer = None
 
-
+deepep_check_threshold = 1e-7
+deepep_check_threshold_probs = 1e-5
 def get_hidden_bytes(x: torch.Tensor) -> int:
     """Calculate the number of hidden bytes for a tensor.
 
@@ -86,6 +87,7 @@ class FusedDispatch(torch.autograd.Function):
         async_finish=False,
         allocate_on_comm_stream=False,
         overlap_moe_expert_parallel_comm=False,
+        cur_chunk_id = None
     ):
         """Forward pass of fused dispatch."""
         previous_event = None
@@ -142,12 +144,13 @@ class FusedDispatch(torch.autograd.Function):
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
         ctx.overlap_moe_expert_parallel_comm = overlap_moe_expert_parallel_comm
         tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
-
+        ctx.cur_chunk_id = cur_chunk_id
+        
         return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, num_tokens_per_rank, handle)
 
     @staticmethod
     def backward(
-        ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, num_tokens_per_rank, grad_handle
+        ctx, grad_output, grad_token_indices, grad_token_probs_output, grad_tokens_per_expert, num_tokens_per_rank, grad_handle
     ):
         """Backward pass of fused dispatch."""
         buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output), ctx.overlap_moe_expert_parallel_comm)
@@ -155,39 +158,89 @@ class FusedDispatch(torch.autograd.Function):
         previous_event = None
         if ctx.async_finish:
             previous_event = EventOverlap(EventHandle())
-
-        grad_x, grad_token_probs, after_event = buffer.combine(
-            grad_output.contiguous(),
-            handle,
-            topk_weights=grad_token_probs.float(),
-            previous_event=previous_event,
-            async_finish=ctx.async_finish,
-            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
-        )
+        
+        if os.environ.get("SYNC_DEEPEP", "0") == "1":
+            # print(f"[sherry info] megatron/core/transformer/moe/fused_a2a.py SYNC_DEEPEP!!!")
+            torch.cuda.synchronize()
+            
+        if os.environ.get("DEEPEP_RETURN_A2AV_OUTPUT", "0") == "1":
+            grad_x, grad_token_probs, after_event, a2av_grad_output = buffer.combine(
+                grad_output.contiguous(),
+                handle,
+                topk_weights=grad_token_probs_output.float(),
+                previous_event=previous_event,
+                async_finish=ctx.async_finish,
+                allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+            )
+        else:
+            grad_x, grad_token_probs, after_event = buffer.combine(
+                grad_output.contiguous(),
+                handle,
+                topk_weights=grad_token_probs_output.float(),
+                previous_event=previous_event,
+                async_finish=ctx.async_finish,
+                allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+            )
+            
         # Make sure current stream is synchronized
         if ctx.async_finish:
             after_event.current_stream_wait()
+            
+        if os.environ.get("DUMP_DEEPEP", "0") == "1":
+            from musa_patch.utils import add_global_debug_datas, get_iteration_id, get_run_batch_id, get_tensor_desc, try_dump_invalid_grad_tensor
+            info = {
+                "grad_output": get_tensor_desc(grad_output),
+                "grad_token_probs_output": get_tensor_desc(grad_token_probs_output),
+                "grad_x": get_tensor_desc(grad_x),
+                "grad_token_probs": get_tensor_desc(grad_token_probs),
+            }
+            if os.environ.get("DEEPEP_RETURN_A2AV_OUTPUT", "0") == "1":
+                info["a2av_grad_output"] = get_tensor_desc(a2av_grad_output)
 
-        return grad_x, None, grad_token_probs, None, None, None, None, None
+            if (any([v["max"] > deepep_check_threshold for k, v in info.items() if "token_probs" not in k]) or
+                any([v["max"] > deepep_check_threshold_probs for k, v in info.items() if "token_probs" in k])):
+                iter_id = get_iteration_id()
+                batch_id = get_run_batch_id()
+                cur_chunk_id = ctx.cur_chunk_id
+                save_key = add_global_debug_datas(iter_id, batch_id, f"chunk_{cur_chunk_id}_dispatch_backward_post_check", info)
+                try_dump_invalid_grad_tensor(iter_id, batch_id, f"{save_key}.grad_output", grad_output, info["grad_output"]["max"])
+                try_dump_invalid_grad_tensor(iter_id, batch_id, f"{save_key}.grad_token_probs_output", grad_token_probs_output, info["grad_token_probs_output"]["max"])
+                try_dump_invalid_grad_tensor(iter_id, batch_id, f"{save_key}.grad_x", grad_x, info["grad_x"]["max"])
+                try_dump_invalid_grad_tensor(iter_id, batch_id, f"{save_key}.grad_token_probs", grad_token_probs, info["grad_token_probs"]["max"])
+                if os.environ.get("DEEPEP_RETURN_A2AV_OUTPUT", "0") == "1":
+                    try_dump_invalid_grad_tensor(iter_id, batch_id, f"{save_key}.a2av_grad_output", a2av_grad_output, info["a2av_grad_output"]["max"])
+                
+            
+        return grad_x, None, grad_token_probs, None, None, None, None, None, None
 
 
 class FusedCombine(torch.autograd.Function):
     """Fused combine operation for MoE output combining computation and communication."""
 
     @staticmethod
-    def forward(ctx, x, group, handle, async_finish=False, allocate_on_comm_stream=False, overlap_moe_expert_parallel_comm=False):
+    def forward(ctx, x, group, handle, async_finish=False, allocate_on_comm_stream=False, overlap_moe_expert_parallel_comm=False,
+        cur_chunk_id = None):
         """Forward pass of fused combine."""
         previous_event = None
         if async_finish:
             previous_event = EventOverlap(EventHandle())
         buffer = get_buffer(group, get_hidden_bytes(x), overlap_moe_expert_parallel_comm)
-        combined_x, _, after_event = buffer.combine(
-            x,
-            handle=handle,
-            async_finish=async_finish,
-            previous_event=previous_event,
-            allocate_on_comm_stream=allocate_on_comm_stream,
-        )
+        if os.environ.get("DEEPEP_RETURN_A2AV_OUTPUT", "0") == "1":
+            combined_x, _, after_event, a2av_output = buffer.combine(
+                x,
+                handle=handle,
+                async_finish=async_finish,
+                previous_event=previous_event,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
+        else:
+            combined_x, _, after_event = buffer.combine(
+                x,
+                handle=handle,
+                async_finish=async_finish,
+                previous_event=previous_event,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
         # Make sure current stream is synchronized
         if async_finish:
             after_event.current_stream_wait()
@@ -197,6 +250,8 @@ class FusedCombine(torch.autograd.Function):
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
         ctx.overlap_moe_expert_parallel_comm = overlap_moe_expert_parallel_comm
+        ctx.cur_chunk_id = cur_chunk_id
+
         return combined_x, None
 
     @staticmethod
@@ -206,7 +261,10 @@ class FusedCombine(torch.autograd.Function):
         if ctx.async_finish:
             previous_event = EventOverlap(EventHandle())
         buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
-
+        
+        if os.environ.get("SYNC_DEEPEP", "0") == "1":
+            torch.cuda.synchronize()
+            
         ace_buffer_idx = 1 if ctx.overlap_moe_expert_parallel_comm else 0
         grad_x, _, _, _, _, after_event = buffer.dispatch(
             grad_output.contiguous(),
@@ -219,8 +277,22 @@ class FusedCombine(torch.autograd.Function):
         # Make sure current stream is synchronized
         if ctx.async_finish:
             after_event.current_stream_wait()
-
-        return grad_x, None, None, None, None, None
+            
+        if os.environ.get("DUMP_DEEPEP", "0") == "1":
+            from musa_patch.utils import add_global_debug_datas, get_iteration_id, get_run_batch_id, get_tensor_desc, try_dump_invalid_grad_tensor
+            info = {
+                "grad_output": get_tensor_desc(grad_output),
+                "grad_x": get_tensor_desc(grad_x)
+            }
+            if any([v["max"] > deepep_check_threshold for v in info.values()]):
+                iter_id = get_iteration_id()
+                batch_id = get_run_batch_id()
+                cur_chunk_id = ctx.cur_chunk_id
+                save_key = add_global_debug_datas(iter_id, batch_id, f"chunk_{cur_chunk_id}_combine_backward_post_check", info)
+                try_dump_invalid_grad_tensor(iter_id, batch_id, f"{save_key}.grad_output", grad_output, info["grad_output"]["max"])
+                try_dump_invalid_grad_tensor(iter_id, batch_id, f"{save_key}.grad_x", grad_x, info["grad_x"]["max"])
+                
+        return grad_x, None, None, None, None, None, None
 
 
 if HAVE_DEEP_EP:
@@ -234,6 +306,7 @@ if HAVE_DEEP_EP:
         async_finish=False,
         allocate_on_comm_stream=False,
         overlap_moe_expert_parallel_comm = False,
+        cur_chunk_id = None
     ):
         """Perform fused dispatch operation if deep_ep is available.
 
@@ -257,9 +330,10 @@ if HAVE_DEEP_EP:
             async_finish,
             allocate_on_comm_stream,
             overlap_moe_expert_parallel_comm,
+            cur_chunk_id
         )
 
-    def fused_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False, overlap_moe_expert_parallel_comm = False):
+    def fused_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False, overlap_moe_expert_parallel_comm = False, cur_chunk_id = None):
         """Perform fused combine operation if deep_ep is available.
 
         Args:
@@ -271,7 +345,7 @@ if HAVE_DEEP_EP:
         Returns:
             Result of FusedCombine
         """
-        return FusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream, overlap_moe_expert_parallel_comm)
+        return FusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream, overlap_moe_expert_parallel_comm, cur_chunk_id)
 
     def set_deepep_num_sms(num_sms):
         """Sets the number of SMs to use for DeepEP"""

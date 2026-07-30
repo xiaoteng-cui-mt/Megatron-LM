@@ -197,7 +197,9 @@ class MoELayer(BaseMoELayer):
             )
             get_fine_grained_offload_handler().wait_offload(offload_tensor_name)
             hidden_states = LaunchReloadFunction.apply(hidden_states, offload_tensor_name)
-            
+        
+        if self.config.moe_token_dispatcher_type == "flex":
+            return self.token_dispatcher.token_dispatch(hidden_states, probs, cur_chunk_id=getattr(self.router, "cur_chunk_id", "unknown"))
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
     def experts_compute(
@@ -264,7 +266,12 @@ class MoELayer(BaseMoELayer):
         experts (e.g., via an All-to-All communication). It then adds the output
         from the shared expert if it exists.
         """
-        output = self.token_dispatcher.token_combine(output)
+        if self.config.moe_token_dispatcher_type == "flex":
+            output = self.token_dispatcher.token_combine(output, cur_chunk_id=getattr(self.router, "cur_chunk_id", "unknown"))
+        else:
+            output = self.token_dispatcher.token_combine(output)
+            
+        
         output = self.token_dispatcher.combine_postprocess(output)
         if shared_expert_output is not None:
             output = output + shared_expert_output

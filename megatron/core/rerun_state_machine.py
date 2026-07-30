@@ -144,7 +144,9 @@ class RerunStateMachine:
         error_injector: optional result injection engine, default is no result injection.
         result_rejected_tracker_filename: optional name of file tracking `result rejected` events.
         continue_on_transient_error: continue to train if previous checkpoint failed due to transient
-                    validation error. Notice: this flag does not work for first re-run.
+                    validation error.
+        continue_on_first_rerun_if_valid: allow first re-run to continue directly if the original failed
+                    validation is not reproduced and the first re-run result passes validation.
 
     Example usage:
 
@@ -196,6 +198,7 @@ class RerunStateMachine:
         error_injector: Optional["RerunErrorInjector"] = None,
         result_rejected_tracker_filename: Optional[str] = None,
         continue_on_transient_error: bool = False,
+        continue_on_first_rerun_if_valid: bool = False,
     ) -> None:
         self.mode: RerunMode = mode
         self.state: RerunState = RerunState.NOT_RUNNING_YET
@@ -216,6 +219,7 @@ class RerunStateMachine:
         # This is all-reduced before continue_requested so that any rank can block continuing.
         self.unexpected_validation_failed_during_rerun: bool = False
         self.continue_on_transient_error: bool = continue_on_transient_error
+        self.continue_on_first_rerun_if_valid: bool = continue_on_first_rerun_if_valid
         self.logged_sdc_enabled: bool = False
 
         self.error_injector: RerunErrorInjector = error_injector or RerunErrorInjector()
@@ -692,9 +696,11 @@ class RerunStateMachine:
                         f"({result} != {initial_result})"
                     )
                     self._log_validation_error_to_file(
-                        status=RerunValidationStatus.FIRST_RERUN_NOT_REPRODUCIBLE,
-                        result=result,
-                        message=message,
+                        status=not_reproducible_status, result=result, message=message
+                    )
+                    logger.error(
+                        f"{rerun_name} not within tolerance: unexpected result is not reproducible "
+                        f"on rank {_safe_get_rank()} ({result} != {initial_result})"
                     )
                     self.failed_validation_continue_decisions[validation_call] = False
                     log_failure("Possible transient error!")
@@ -706,9 +712,7 @@ class RerunStateMachine:
                         self.suspicious_node = os.uname()[1]
                         self.suspicious_device = torch.cuda.current_device()
                     self._log_validation_error_to_file(
-                        status=RerunValidationStatus.FIRST_RERUN_REPRODUCIBLE,
-                        result=result,
-                        message=message,
+                        status=reproducible_status, result=result, message=message
                     )
                     logger.warning(
                         "First rerun: unexpected result is reproducible within the tolerance "

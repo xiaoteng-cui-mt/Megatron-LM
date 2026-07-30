@@ -262,6 +262,9 @@ class _ParamAndGradBucketGroup:
 
         # give 5% tolerance buffer for non-deterministic FA backward
         grad_norm_rerun_tolerance = float(os.getenv("MEGATRON_GRAD_NORM_RERUN_TOLERANCE", 0.05))
+        if os.environ.get("DUMP_DEEPEP", "0") == "1":
+            from musa_patch.utils import dump_global_debug_datas
+            dump_global_debug_datas()
 
         for i in range(len(self.buckets)):
             bucket = self.buckets[i]

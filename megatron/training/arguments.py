@@ -2056,6 +2056,9 @@ def _add_rerun_machine_args(parser):
                        'non-deterministic algorithms.')
     group.add_argument('--train-continue-on-transient-error', action='store_true',
                        help='Continue training when a failed validation is not reproduced during rerun.')
+    group.add_argument('--continue-on-first-rerun-if-valid', action='store_true',
+                       help='Continue training after first rerun if the failed validation is not '
+                       'reproduced and the first rerun result passes validation.')
 
     return parser
 
