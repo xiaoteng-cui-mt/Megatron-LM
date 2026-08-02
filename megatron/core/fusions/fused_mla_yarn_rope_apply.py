@@ -15,7 +15,9 @@ try:
     if version.parse(triton.__version__) < version.parse("3.4.0") and not torch.cuda.is_available():
         HAVE_TRITON = False
     else:
-        HAVE_TRITON = tl.constexpr(version.parse(triton.__version__) >= version.parse("2.0.0"))
+        # 3.0 is the floor: the kernels below interleave/de-interleave the
+        # embedding in registers with tl.join/tl.split, which land in Triton 3.0.
+        HAVE_TRITON = tl.constexpr(version.parse(triton.__version__) >= version.parse("3.0.0"))
 except ImportError:
     HAVE_TRITON = False
 
@@ -29,17 +31,26 @@ if not HAVE_TRITON:
 
 @triton.jit
 def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
-    token_idx = -1
-    this_seq_len = 0
-    seq_idx = 0
-    last_cum_seqlen = tl.load(cu_seqlens) // cp_size
-    while seq_idx < seq_num:
-        cur_cum_seqlen = tl.load(cu_seqlens + seq_idx + 1) // cp_size
-        if token_idx == -1 and cur_cum_seqlen > pid_m:
-            token_idx = pid_m - last_cum_seqlen
-            this_seq_len = cur_cum_seqlen - last_cum_seqlen
-        last_cum_seqlen = cur_cum_seqlen
-        seq_idx += 1
+    # Binary search for the sequence owning pid_m. cu_seqlens is non-decreasing,
+    # so `cu_seqlens[i + 1] // cp_size > pid_m` is monotonic in i and bisection
+    # is exact (including for empty sequences, which it simply steps over).
+    # A linear scan here costs seq_num loads in *every* program, which dominates
+    # the kernel as soon as a micro-batch packs more than a few sequences.
+    lo = 0
+    hi = seq_num
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if tl.load(cu_seqlens + mid + 1) // cp_size > pid_m:
+            hi = mid
+        else:
+            lo = mid + 1
+    # pid_m always lies inside the packed range, but clamp so a caller passing a
+    # larger grid reads in bounds rather than off the end of cu_seqlens.
+    lo = tl.minimum(lo, seq_num - 1)
+    last_cum_seqlen = tl.load(cu_seqlens + lo) // cp_size
+    cur_cum_seqlen = tl.load(cu_seqlens + lo + 1) // cp_size
+    token_idx = pid_m - last_cum_seqlen
+    this_seq_len = cur_cum_seqlen - last_cum_seqlen
     if cp_size > 1:
         if token_idx < this_seq_len // 2:
             token_idx = token_idx + cp_rank * this_seq_len // 2
@@ -50,20 +61,20 @@ def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
     return token_idx
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BLOCK_H": 1}),
-#         triton.Config({"BLOCK_H": 2}),
-#         triton.Config({"BLOCK_H": 4}),
-#         triton.Config({"BLOCK_H": 8}),
-#         triton.Config({"BLOCK_H": 16}),
-#         triton.Config({"BLOCK_H": 32}),
-#         triton.Config({"BLOCK_H": 64}),
-#         triton.Config({"BLOCK_H": 128}),
-#     ],
-#     key=["emb_dim", "head_num"],
-#     restore_value=["Q"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 1}),
+        triton.Config({"BLOCK_H": 2}),
+        triton.Config({"BLOCK_H": 4}),
+        triton.Config({"BLOCK_H": 8}),
+        triton.Config({"BLOCK_H": 16}),
+        triton.Config({"BLOCK_H": 32}),
+        triton.Config({"BLOCK_H": 64}),
+        triton.Config({"BLOCK_H": 128}),
+    ],
+    key=["emb_dim", "head_num"],
+    restore_value=["Q"],
+)
 @triton.jit
 def rotary_fwd_q_kernel(
     Q,
@@ -114,12 +125,15 @@ def rotary_fwd_q_kernel(
     Q = Q + pid_m * stride_x_seq + pid_head * BLOCK_H * stride_x_nheads
 
     x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + qk_head_dim
-    mask = x_off < head_num * stride_x_nheads
+    mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
+    # This update is in place: the emb slice we store to is the slice we load
+    # from. Gathering x1/x2 straight out of global memory with a stride of 2
+    # would make that racy -- one thread's store can land before another
+    # thread's load of the same address, and nothing in the tile orders them.
+    # So read the slice once, contiguously, and de-interleave in registers.
     # x1 = t[..., 0::2], x2 = t[..., 1::2]
-    x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
-    x_2_off = x_1_off + 1
-    x_1 = tl.load(Q + x_1_off, mask=mask)
-    x_2 = tl.load(Q + x_2_off, mask=mask)
+    x = tl.load(Q + x_off + tl.arange(0, emb_dim)[None, :], mask=mask)
+    x_1, x_2 = tl.split(tl.reshape(x, (BLOCK_H, emb_dim // 2, 2)))
 
     x_left = x_1 * cos_left - x_2 * sin_left
     x_right = x_2 * cos_right + x_1 * sin_right
@@ -130,20 +144,20 @@ def rotary_fwd_q_kernel(
     tl.store(Q + x_right_off, x_right, mask=mask)
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BLOCK_H": 1}),
-#         triton.Config({"BLOCK_H": 2}),
-#         triton.Config({"BLOCK_H": 4}),
-#         triton.Config({"BLOCK_H": 8}),
-#         triton.Config({"BLOCK_H": 16}),
-#         triton.Config({"BLOCK_H": 32}),
-#         triton.Config({"BLOCK_H": 64}),
-#         triton.Config({"BLOCK_H": 128}),
-#     ],
-#     key=["emb_dim", "head_num"],
-#     restore_value=["DO"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 1}),
+        triton.Config({"BLOCK_H": 2}),
+        triton.Config({"BLOCK_H": 4}),
+        triton.Config({"BLOCK_H": 8}),
+        triton.Config({"BLOCK_H": 16}),
+        triton.Config({"BLOCK_H": 32}),
+        triton.Config({"BLOCK_H": 64}),
+        triton.Config({"BLOCK_H": 128}),
+    ],
+    key=["emb_dim", "head_num"],
+    restore_value=["DO"],
+)
 @triton.jit
 def rotary_bwd_q_kernel(
     DO,
@@ -192,7 +206,7 @@ def rotary_bwd_q_kernel(
     DO = DO + pid_m * stride_x_seq + pid_head * BLOCK_H * stride_x_nheads
 
     x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + qk_head_dim
-    mask = x_off < head_num * stride_x_nheads
+    mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
     x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
     x_right_off = x_left_off + emb_dim // 2
     x_left = tl.load(DO + x_left_off, mask=mask)
@@ -201,10 +215,11 @@ def rotary_bwd_q_kernel(
     x_1 = x_left * cos_left + x_right * sin_right
     x_2 = -x_left * sin_left + x_right * cos_right
 
-    x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
-    x_2_off = x_1_off + 1
-    tl.store(DO + x_1_off, x_1, mask=mask)
-    tl.store(DO + x_2_off, x_2, mask=mask)
+    # Same in-place hazard as the forward kernel, mirrored: re-interleave in
+    # registers and write the slice back with one contiguous store instead of
+    # two stride-2 stores into the range we just read.
+    x_out = tl.reshape(tl.join(x_1, x_2), (BLOCK_H, emb_dim))
+    tl.store(DO + x_off + tl.arange(0, emb_dim)[None, :], x_out, mask=mask)
 
 
 class ApplyMLARotaryEmbQ(torch.autograd.Function):
@@ -269,12 +284,7 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
             q.stride(1),
             cp_rank,
             cp_size,
-            16,
         )
-
-        # block_h = rotary_fwd_q_kernel.best_config.kwargs.get('BLOCK_H')
-        # print(f"rotary_fwd_q_kernel BLOCK_H = {block_h}")
-
         ctx.save_for_backward(cos, sin)
         ctx.qk_head_dim = qk_head_dim
         ctx.emb_dim = emb_dim
@@ -323,12 +333,7 @@ class ApplyMLARotaryEmbQ(torch.autograd.Function):
             grad.stride(1),
             ctx.cp_rank,
             ctx.cp_size,
-            2,
         )
-
-        # block_h = rotary_bwd_q_kernel.best_config.kwargs.get('BLOCK_H')
-        # print(f"rotary_bwd_q_kernel BLOCK_H = {block_h}")
-        
         if ctx.cu_seqlens_q is None:
             grad = grad.view(max_seqlen, batch_size, nheads, headdim)
         return grad, None, None, None, None, None, None, None, None
@@ -373,19 +378,19 @@ def fused_apply_mla_rope_for_q(
     )
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BLOCK_H": 1}),
-#         triton.Config({"BLOCK_H": 2}),
-#         triton.Config({"BLOCK_H": 4}),
-#         triton.Config({"BLOCK_H": 8}),
-#         triton.Config({"BLOCK_H": 16}),
-#         triton.Config({"BLOCK_H": 32}),
-#         triton.Config({"BLOCK_H": 64}),
-#         triton.Config({"BLOCK_H": 128}),
-#     ],
-#     key=["emb_dim", "k_dim", "v_dim", "head_num"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 1}),
+        triton.Config({"BLOCK_H": 2}),
+        triton.Config({"BLOCK_H": 4}),
+        triton.Config({"BLOCK_H": 8}),
+        triton.Config({"BLOCK_H": 16}),
+        triton.Config({"BLOCK_H": 32}),
+        triton.Config({"BLOCK_H": 64}),
+        triton.Config({"BLOCK_H": 128}),
+    ],
+    key=["emb_dim", "k_dim", "v_dim", "head_num"],
+)
 @triton.jit
 def rotary_fwd_kv_kernel(
     KV,
@@ -447,7 +452,7 @@ def rotary_fwd_kv_kernel(
 
     KV_ptr = KV + pid_m * stride_kv_seq + pid_head * BLOCK_H * stride_kv_nheads
     kv_off = tl.arange(0, BLOCK_H)[:, None] * stride_kv_nheads
-    mask = kv_off < head_num * stride_kv_nheads
+    mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
     k_in_off = kv_off + tl.arange(0, k_dim)[None, :]
     v_in_off = kv_off + k_dim + tl.arange(0, v_dim)[None, :]
     k = tl.load(KV_ptr + k_in_off, mask=mask)
@@ -462,9 +467,10 @@ def rotary_fwd_kv_kernel(
     tl.store(V_ptr + v_out_off, v, mask=mask)
 
     EMB = K_POS_EMB + pid_m * stride_emb_seq
-    # x1 = t[..., 0::2], x2 = t[..., 1::2]
-    x_1 = tl.load(EMB + tl.arange(0, emb_dim // 2) * 2)
-    x_2 = tl.load(EMB + tl.arange(0, emb_dim // 2) * 2 + 1)
+    # x1 = t[..., 0::2], x2 = t[..., 1::2] -- read contiguously, split in
+    # registers (this one is not in place, but the single access is cheaper).
+    x_emb = tl.load(EMB + tl.arange(0, emb_dim))
+    x_1, x_2 = tl.split(tl.reshape(x_emb, (emb_dim // 2, 2)))
 
     x_left = x_1 * cos_left - x_2 * sin_left
     x_right = x_2 * cos_right + x_1 * sin_right
@@ -481,19 +487,19 @@ def rotary_fwd_kv_kernel(
     tl.store(K_ptr + x_right_off, x_right, mask=mask)
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BLOCK_H": 1}),
-#         triton.Config({"BLOCK_H": 2}),
-#         triton.Config({"BLOCK_H": 4}),
-#         triton.Config({"BLOCK_H": 8}),
-#         triton.Config({"BLOCK_H": 16}),
-#         triton.Config({"BLOCK_H": 32}),
-#         triton.Config({"BLOCK_H": 64}),
-#         triton.Config({"BLOCK_H": 128}),
-#     ],
-#     key=["emb_dim", "k_dim", "v_dim", "head_num"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 1}),
+        triton.Config({"BLOCK_H": 2}),
+        triton.Config({"BLOCK_H": 4}),
+        triton.Config({"BLOCK_H": 8}),
+        triton.Config({"BLOCK_H": 16}),
+        triton.Config({"BLOCK_H": 32}),
+        triton.Config({"BLOCK_H": 64}),
+        triton.Config({"BLOCK_H": 128}),
+    ],
+    key=["emb_dim", "k_dim", "v_dim", "head_num"],
+)
 @triton.jit
 def rotary_bwd_kv_kernel(
     dK,
@@ -546,7 +552,7 @@ def rotary_bwd_kv_kernel(
 
     dKV_ptr = dKV + pid_m * stride_dkv_seq + pid_head * BLOCK_H * stride_dkv_nheads
     dkv_off = tl.arange(0, BLOCK_H)[:, None] * stride_dkv_nheads
-    mask = dkv_off < head_num * stride_dkv_nheads
+    mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
     dk_out_off = dkv_off + tl.arange(0, k_dim)[None, :]
     dv_out_off = dkv_off + k_dim + tl.arange(0, v_dim)[None, :]
 
@@ -565,11 +571,11 @@ def rotary_bwd_kv_kernel(
         for i in tl.static_range(triton.cdiv(head_num, BLOCK_H)):
             dK_ptr = dK + pid_m * stride_dk_seq + i * BLOCK_H * stride_dk_nheads
             x_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + k_dim
-            mask = x_off < head_num * stride_dk_nheads
+            red_mask = (i * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
             x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
             x_right_off = x_left_off + emb_dim // 2
-            x_left = tl.load(dK_ptr + x_left_off, mask=mask)
-            x_right = tl.load(dK_ptr + x_right_off, mask=mask)
+            x_left = tl.load(dK_ptr + x_left_off, mask=red_mask, other=0.0)
+            x_right = tl.load(dK_ptr + x_right_off, mask=red_mask, other=0.0)
             x_left_accum += x_left
             x_right_accum += x_right
         x_left_accum = tl.sum(x_left_accum, axis=0)
@@ -585,8 +591,8 @@ def rotary_bwd_kv_kernel(
         x_1 = x_left_accum * cos_left + x_right_accum * sin_right
         x_2 = -x_left_accum * sin_left + x_right_accum * cos_right
         dEMB_ptr = dEMB + pid_m * stride_demb_seq
-        tl.store(dEMB_ptr + tl.arange(0, emb_dim // 2) * 2, x_1)
-        tl.store(dEMB_ptr + tl.arange(0, emb_dim // 2) * 2 + 1, x_2)
+        d_emb_out = tl.reshape(tl.join(x_1, x_2), (emb_dim,))
+        tl.store(dEMB_ptr + tl.arange(0, emb_dim), d_emb_out)
 
 
 class ApplyMLARotaryEmbKV(torch.autograd.Function):
@@ -668,12 +674,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
             o_value.stride(1),
             cp_rank,
             cp_size,
-            64,
         )
-
-        # block_h = rotary_fwd_kv_kernel.best_config.kwargs.get('BLOCK_H')
-        # print(f"rotary_fwd_kv_kernel BLOCK_H = {block_h}")
-
         ctx.save_for_backward(cos, sin)
         ctx.rotary_interleaved = rotary_interleaved
         ctx.emb_dim = emb_dim
@@ -741,12 +742,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
             d_emb.stride(0),
             ctx.cp_rank,
             ctx.cp_size,
-            16,
         )
-
-        # block_h = rotary_bwd_kv_kernel.best_config.kwargs.get('BLOCK_H')
-        # print(f"rotary_bwd_kv_kernel BLOCK_H = {block_h}")
-
         if ctx.cu_seqlens_kv is None:
             d_kv = d_kv.view(max_seqlen, batch_size, nheads, ctx.k_dim + ctx.v_dim)
             d_emb = d_emb.view(max_seqlen, batch_size, 1, ctx.emb_dim)

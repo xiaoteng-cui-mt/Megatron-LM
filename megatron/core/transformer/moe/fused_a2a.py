@@ -158,10 +158,6 @@ class FusedDispatch(torch.autograd.Function):
         previous_event = None
         if ctx.async_finish:
             previous_event = EventOverlap(EventHandle())
-        
-        if os.environ.get("SYNC_DEEPEP", "0") == "1":
-            # print(f"[sherry info] megatron/core/transformer/moe/fused_a2a.py SYNC_DEEPEP!!!")
-            torch.cuda.synchronize()
             
         if os.environ.get("DEEPEP_RETURN_A2AV_OUTPUT", "0") == "1":
             grad_x, grad_token_probs, after_event, a2av_grad_output = buffer.combine(
@@ -261,9 +257,6 @@ class FusedCombine(torch.autograd.Function):
         if ctx.async_finish:
             previous_event = EventOverlap(EventHandle())
         buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
-        
-        if os.environ.get("SYNC_DEEPEP", "0") == "1":
-            torch.cuda.synchronize()
             
         ace_buffer_idx = 1 if ctx.overlap_moe_expert_parallel_comm else 0
         grad_x, _, _, _, _, after_event = buffer.dispatch(
@@ -284,6 +277,7 @@ class FusedCombine(torch.autograd.Function):
                 "grad_output": get_tensor_desc(grad_output),
                 "grad_x": get_tensor_desc(grad_x)
             }
+                
             if any([v["max"] > deepep_check_threshold for v in info.values()]):
                 iter_id = get_iteration_id()
                 batch_id = get_run_batch_id()
@@ -320,7 +314,7 @@ if HAVE_DEEP_EP:
 
         Returns:
             Result of FusedDispatch
-        """
+        """        
         return FusedDispatch.apply(
             x.contiguous(),
             token_indices,

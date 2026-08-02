@@ -1066,7 +1066,7 @@ def initialize_model_parallel(
         # replicated output_layer weights in sync is well-defined. For the default (single loss
         # stage) this group has size 1 and the sync all-reduce is a no-op.
         loss_ranks = get_loss_ranks(ranks)
-        print(f"rank={torch.distributed.get_rank()}, get_loss_ranks={loss_ranks}!")
+        # print(f"rank={torch.distributed.get_rank()}, get_loss_ranks={loss_ranks}!")
         group = create_group(
             loss_ranks,
             timeout=timeout,

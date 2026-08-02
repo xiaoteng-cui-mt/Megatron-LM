@@ -314,7 +314,9 @@ class _ParamAndGradBucketGroup:
                 except (TypeError, ValueError):
                     large_grad_norm_threshold = None
 
+                large_grad_norm_baseline = None
                 if large_grad_norm_threshold is not None and large_grad_norm_threshold > 0:
+                    large_grad_norm_baseline = grad_norm.detach().new_tensor(large_grad_norm_threshold)
                     large_grad_norm_rejection_func = (
                         lambda result: result.item() >= large_grad_norm_threshold
                     )
@@ -348,6 +350,7 @@ class _ParamAndGradBucketGroup:
                         f"in backward pass before data-parallel communication collective",
                         tolerance=grad_norm_rerun_tolerance,
                         fatal=False,
+                        unexpected_validation_baseline=large_grad_norm_baseline,
                     )
 
     def start_param_sync(self, force_sync: bool = False):
