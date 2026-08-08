@@ -1036,6 +1036,14 @@ def validate_args(args, defaults={}):
     if args.load_main_params_from_ckpt:
         assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
 
+    if args.use_dist_ckpt and args.async_save and not args.use_persistent_ckpt_worker:
+        if args.rank == 0:
+            print(
+                'Warning: --async-save is not supported without '
+                '--use-persistent-ckpt-worker. Disabling --async-save.'
+            )
+        args.async_save = False
+
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
         assert args.pipeline_model_parallel_size > 1, \
