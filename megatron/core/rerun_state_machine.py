@@ -490,20 +490,26 @@ class RerunStateMachine:
         if self.mode in [RerunMode.DISABLED, RerunMode.REPORT_DETERMINISM_STATS]:
             return False, False, 0
         if self.state == RerunState.WILL_VERIFY_TRANSIENT_FROM_CHECKPOINT:
+            save_ckpt = int(os.getenv("SAVE_CKPT_FOR_SECOND_RERUN", 1)) == 1
             if _safe_get_rank() == 0:
                 logger.warning(
                     "Exiting now. A checkpoint at the last iteration is being saved "
                     "if further examination is needed"
                 )
-            return True, True, EXIT_CODE_FAILED_ON_RESULT_VALIDATION
+                if not save_ckpt:
+                    logger.warning("Checkpoint is not being saved as SAVE_CKPT_FOR_SECOND_RERUN is set to 0")
+            return save_ckpt, True, EXIT_CODE_FAILED_ON_RESULT_VALIDATION
         elif self.state == RerunState.WILL_RERUN_FROM_CHECKPOINT:
+            save_ckpt = int(os.getenv("SAVE_CKPT_FOR_SECOND_RERUN", 1)) == 1
             if _safe_get_rank() == 0:
                 logger.warning(
                     "Saving a checkpoint and exiting now. Please resume the job "
                     "from the checkpoint to rerun the last iteration "
                     "and establish a diagnostic"
                 )
-            return True, True, EXIT_CODE_RESUME_TO_DISAMBIGUATE
+                if not save_ckpt:
+                    logger.warning("Checkpoint is not being saved as SAVE_CKPT_FOR_SECOND_RERUN is set to 0")
+            return save_ckpt, True, EXIT_CODE_RESUME_TO_DISAMBIGUATE
         elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
             if _safe_get_rank() == 0:
                 logger.warning(
