@@ -1746,9 +1746,6 @@ def save_checkpoint_and_time(
     timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
     timers(timer_key, log_level=0).start(barrier=True)
     
-    from transformer_engine.pytorch.cpu_offload import get_fine_grained_offload_handler
-    get_fine_grained_offload_handler().release_cpu_pinmem_pool()
-
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
     if should_disable_forward_pre_hook(args):
