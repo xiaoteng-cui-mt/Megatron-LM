@@ -4,8 +4,12 @@
 This module provides an async utilities which allow to start
 a checkpoint save process in the background.
 """
+import ctypes
 import gc
 import logging
+import os
+import signal
+import sys
 from abc import ABC, abstractmethod
 from collections import deque
 from contextlib import contextmanager
@@ -19,6 +23,30 @@ from torch import multiprocessing as mp
 from ..utils import debug_time
 
 logger = logging.getLogger(__name__)
+
+
+def _set_parent_death_signal(parent_pid: int) -> None:
+    """Terminate this Linux child process if its trainer parent dies.
+
+    ``multiprocessing`` only cleans up children during an orderly interpreter
+    shutdown. A native crash or SIGKILL skips that cleanup and otherwise leaves
+    a persistent checkpoint worker behind. PR_SET_PDEATHSIG makes the kernel
+    terminate the child in that case. The parent PID checks close the race where
+    the parent exits before or while the child installs the death signal.
+    """
+    if sys.platform != 'linux':
+        return
+
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 @contextmanager
@@ -307,8 +335,12 @@ class PersistentAsyncCaller(AsyncCaller):
                     self.preload_q,
                     self.comp_q,
                     logger.getEffectiveLevel(),
+                    os.getpid(),
                 ),
             )
+            # Let Python terminate the worker during exception-driven shutdown.
+            # PR_SET_PDEATHSIG in async_loop covers crashes that skip atexit.
+            self.process.daemon = True
             self.process.start()
             logger.info(
                 f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Started Async Caller"
@@ -388,22 +420,30 @@ class PersistentAsyncCaller(AsyncCaller):
 
         return is_done
 
-    def close(self):
+    def close(self, abort: bool = False):
         """Wait on the left async requests and terminate the PersistentAsyncCaller
 
         Signals the PersistentAsyncCaller by sending a 'DONE' message to make it terminated
+
+        Args:
+            abort (bool): kill the worker instead of draining its request queue
         """
-        logger.info(
-            f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller"
-        )
+        logger.info("PersistentAsyncCaller: Destroying Async Caller")
         if self.process:
-            self.queue.put('DONE')
-            self.queue.join()
+            if abort:
+                if self.process.is_alive():
+                    self.process.kill()
+            elif self.process.is_alive():
+                self.queue.put('DONE')
+                self.queue.join()
             self.process.join()
             self.process = None
 
     def __del__(self):
-        self.close()
+        # During exception-driven interpreter shutdown daemon children can be
+        # terminated before object finalizers run. Never enqueue DONE and wait
+        # forever for a worker that can no longer acknowledge it.
+        self.close(abort=True)
 
     @staticmethod
     @_disable_gc()
@@ -413,6 +453,7 @@ class PersistentAsyncCaller(AsyncCaller):
         preload_q: mp.JoinableQueue,
         comp_q: mp.Queue,
         log_level: int = logging.INFO,
+        parent_pid: Optional[int] = None,
     ):
         """Main function for the persistent checkpoint worker
 
@@ -434,8 +475,12 @@ class PersistentAsyncCaller(AsyncCaller):
                                async checkpoint request
             log_level (int, Optional): an integer to set log-level in this spawned process
                                        to get aligned with the training rank's logging level
+            parent_pid (int, Optional): trainer PID whose death terminates this worker
 
         """
+        if parent_pid is not None:
+            _set_parent_death_signal(parent_pid)
+
         logger = logging.getLogger(__name__)
         logger.setLevel(log_level)
         logger.info(f"PersistentAsyncCaller: persistent ckpt worker for {rank} has started")

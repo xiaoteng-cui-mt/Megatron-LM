@@ -11,6 +11,7 @@ import queue
 from functools import partial
 from heapq import heappop, heappush
 from itertools import chain
+from multiprocessing.managers import SyncManager
 from operator import itemgetter
 from pathlib import Path
 from time import time
@@ -32,7 +33,7 @@ from torch.distributed.checkpoint.planner import SavePlan, SavePlanner, WriteIte
 from torch.distributed.checkpoint.storage import WriteResult
 from torch.futures import Future
 
-from .async_utils import _disable_gc
+from .async_utils import _disable_gc, _set_parent_death_signal
 
 logger = logging.getLogger(__name__)
 
@@ -46,13 +47,16 @@ except ImportError:
     HAVE_PSUTIL = False
 
 _results_queue = None
+_results_manager = None
 
 
 def _get_write_results_queue():
-    global _results_queue
+    global _results_manager, _results_queue
     if _results_queue is None:
         ctx = mp.get_context("spawn")
-        _results_queue = ctx.Manager().Queue()
+        _results_manager = SyncManager(ctx=ctx)
+        _results_manager.start(initializer=_set_parent_death_signal, initargs=(os.getpid(),))
+        _results_queue = _results_manager.Queue()
     return _results_queue
 
 
