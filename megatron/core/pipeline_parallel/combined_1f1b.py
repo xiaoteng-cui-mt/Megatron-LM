@@ -407,6 +407,11 @@ def combined_forward_backward_step(
             b_microbatch_id_layer_id=b_microbatch_id_layer_id,
         )
 
+    if f_model is not None:
+        from .schedules import _log_pp_hidden_state_norm
+
+        _log_pp_hidden_state_norm(output_tensor, current_microbatch, num_microbatches, f_model_chunk_id)
+
     # forward post process
     num_tokens = None
     if f_model is not None:

@@ -773,7 +773,7 @@ def track_moe_metrics(
             for key in track_names:
                 if key not in tracker:
                     tracker[key] = {}
-                    tracker[key]["values"] = torch.zeros(num_layers, device="cuda")
+                    tracker[key]["values"] = torch.zeros(num_layers + (mtp_num_layers or 0), device="cuda")
                     tracker[key]["reduce_group"] = None
                     tracker[key]["avg_group"] = None
     reduce_aux_losses_tracker_across_ranks(track_names)

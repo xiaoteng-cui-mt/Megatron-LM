@@ -260,24 +260,55 @@ class MTPLossLoggingHelper:
                 values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
 
+    @staticmethod
+    def transfer_loss_to_last_rank(last_rank: int, mtp_num_layers: int):
+        """Transfer MTP loss values to the rank that owns the TensorBoard writer.
+
+        All loss stages participate so this remains safe with pipeline-parallel
+        layouts where the MTP loss stage and the final stage are different ranks.
+        """
+        tracker = MTPLossLoggingHelper.tracker
+        has_values = "values" in tracker
+        loss_group = parallel_state.get_loss_group(check_initialized=False)
+        assert loss_group is not None, "loss group must be initialized for MTP loss allgather"
+
+        device = torch.cuda.current_device()
+        values = tracker["values"] if has_values else torch.zeros(mtp_num_layers, device=device)
+        gathered = [
+            torch.empty_like(values)
+            for _ in range(torch.distributed.get_world_size(loss_group))
+        ]
+        torch.distributed.all_gather(gathered, values, group=loss_group)
+
+        if torch.distributed.get_rank() == last_rank:
+            tracker["values"] = torch.stack(gathered).sum(dim=0)
+        elif has_values:
+            MTPLossLoggingHelper.clean_loss_in_tracker()
+
     def track_mtp_metrics(
         loss_scale,
         iteration,
         writer,
         wandb_writer=None,
         total_loss_dict=None,
-        log_to_stdout=False,
         reduce_for_logging=True,
+        last_rank=None,
+        mtp_num_layers=None,
     ):
         """Track the Multi-Token Prediction (MTP) metrics for logging."""
         if reduce_for_logging:
             MTPLossLoggingHelper.reduce_loss_in_tracker()
+        if (
+            last_rank is not None
+            and mtp_num_layers is not None
+            and parallel_state.get_loss_group(check_initialized=False) is not None
+        ):
+            MTPLossLoggingHelper.transfer_loss_to_last_rank(last_rank, mtp_num_layers)
         tracker = MTPLossLoggingHelper.tracker
         if "values" not in tracker:
             return
         mtp_losses = tracker["values"] * loss_scale
         mtp_num_layers = mtp_losses.shape[0]
-        mtp_log_values = []
         for i in range(mtp_num_layers):
             name = f"mtp_{i+1} loss"
             loss = mtp_losses[i]
@@ -286,21 +317,10 @@ class MTPLossLoggingHelper:
                     total_loss_dict[name] += loss
                 else:
                     total_loss_dict[name] = loss
-            if log_to_stdout:
-                mtp_log_values.append(f'{name}: {loss.item():.6E}')
             if writer is not None:
                 writer.add_scalar(name, loss, iteration)
             if wandb_writer is not None:
                 wandb_writer.log({f"{name}": loss}, iteration)
-
-        if log_to_stdout and mtp_log_values:
-            if torch.distributed.is_initialized():
-                rank = torch.distributed.get_rank()
-                log_string = f'(rank {rank}) iteration {iteration:8d} | ' + ' | '.join(mtp_log_values) + ' |'
-            else:
-                log_string = f' iteration {iteration:8d} | ' + ' | '.join(mtp_log_values) + ' |'
-            if parallel_state.get_data_parallel_rank(with_context_parallel=True) == parallel_state.get_data_parallel_world_size() -1:
-                print(log_string, flush=True)
 
         MTPLossLoggingHelper.clean_loss_in_tracker()
 

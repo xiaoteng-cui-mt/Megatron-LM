@@ -1,6 +1,8 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
+import logging
+import os
 from functools import partial
 from typing import Callable, Iterator, List, Optional, Union
 
@@ -37,6 +39,126 @@ from .combined_1f1b import (
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+logger = logging.getLogger(__name__)
+
+_LOG_PP_HIDDEN_STATE_NORM_ENV = "MEGATRON_LOG_PP_HIDDEN_STATE_NORM"
+_PP_HIDDEN_STATE_NORM_STATE = {}
+
+
+def _is_pp_hidden_state_norm_enabled():
+    return int(os.getenv(_LOG_PP_HIDDEN_STATE_NORM_ENV, "0")) != 0
+
+
+def _tensor_norm_sum(output_tensor):
+    if torch.is_tensor(output_tensor):
+        return output_tensor.detach().float().norm()
+    if isinstance(output_tensor, (list, tuple)):
+        total = None
+        for item in output_tensor:
+            if item is None:
+                continue
+            value = _tensor_norm_sum(item)
+            if value is None:
+                continue
+            total = value if total is None else total + value
+        return total
+    if isinstance(output_tensor, dict):
+        total = None
+        for item in output_tensor.values():
+            if item is None:
+                continue
+            value = _tensor_norm_sum(item)
+            if value is None:
+                continue
+            total = value if total is None else total + value
+        return total
+    return None
+
+
+def _get_pp_hidden_state_norm_context(vp_stage):
+    iteration_id = None
+    run = "initial"
+    try:
+        from megatron.core.rerun_state_machine import get_rerun_state_machine
+
+        rerun_state_machine = get_rerun_state_machine()
+        iteration_id = rerun_state_machine.current_iteration
+        rerun_state = getattr(rerun_state_machine, "state", None)
+        rerun_state_name = getattr(rerun_state, "name", str(rerun_state))
+        run = {
+            "RERUNNING_IN_PLACE": "first_rerun",
+            "RERUNNING_FROM_CHECKPOINT": "sec_rerun",
+            "RERUNNING_AGAIN_FROM_CHECKPOINT": "sec_rerun",
+        }.get(rerun_state_name, "initial")
+    except Exception:
+        iteration_id = None
+
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    else:
+        rank = 0
+    local_rank = int(os.getenv("LOCAL_RANK", str(rank)))
+    try:
+        dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    except Exception:
+        dp_rank = 0
+    try:
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    except Exception:
+        pp_rank = 0
+    return {
+        "iteration_id": iteration_id,
+        "rank": rank,
+        "local_rank": local_rank,
+        "dp_rank": dp_rank,
+        "pp_rank": pp_rank,
+        "vp_stage": None if vp_stage is None else vp_stage,
+        "run": run,
+    }
+
+
+def _log_pp_hidden_state_norm(output_tensor, current_microbatch, num_microbatches, vp_stage):
+    if not _is_pp_hidden_state_norm_enabled():
+        return
+
+    context = _get_pp_hidden_state_norm_context(vp_stage)
+    stage_id = (context["pp_rank"], -1 if vp_stage is None else vp_stage)
+    mbc_norm = _tensor_norm_sum(output_tensor)
+    if mbc_norm is None:
+        return
+    state = _PP_HIDDEN_STATE_NORM_STATE.setdefault(
+        stage_id,
+        {"batch_norm_total": None, "num_microbatches": num_microbatches},
+    )
+    state["batch_norm_total"] = mbc_norm if state["batch_norm_total"] is None else state["batch_norm_total"] + mbc_norm
+    state["num_microbatches"] = num_microbatches
+    state["last_microbatch"] = current_microbatch
+    state["context"] = context
+
+
+def _flush_pp_hidden_state_norm():
+    if not _is_pp_hidden_state_norm_enabled():
+        return
+
+    lines = []
+    for (pp_rank, vp_stage), state in sorted(_PP_HIDDEN_STATE_NORM_STATE.items()):
+        batch_norm_total = state["batch_norm_total"]
+        if torch.is_tensor(batch_norm_total):
+            batch_norm_total = batch_norm_total.detach().float().item()
+        lines.append(
+            "[pp hidden state norm summary] "
+            f"rank={state.get('context', {}).get('rank')} "
+            f"dp={state.get('context', {}).get('dp_rank')} "
+            f"pp={pp_rank} "
+            f"iteration={state.get('context', {}).get('iteration_id')} "
+            f"mbc={state['num_microbatches']} "
+            f"run={state.get('context', {}).get('run')} "
+            f"batch_norm_total={batch_norm_total:.6f} "
+        )
+    if lines:
+        print("\n".join(lines), flush=True)
+    _PP_HIDDEN_STATE_NORM_STATE.clear()
 
 
 def get_forward_backward_func():
@@ -404,6 +526,7 @@ def forward_step(
             output_tensor, loss_func = forward_step_func(
                 data_iterator, model, checkpoint_activations_microbatch
             )
+    _log_pp_hidden_state_norm(output_tensor, current_microbatch, num_microbatches, vp_stage)
     output_tensor, num_tokens = forward_step_calc_loss(
         model,
         output_tensor,
@@ -661,6 +784,7 @@ def forward_backward_no_pipelining(
     ):
         create_cudagraphs()
 
+    _flush_pp_hidden_state_norm()
     return forward_data_store
 
 
@@ -2059,6 +2183,7 @@ def forward_backward_pipelining_with_interleaving(
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
+    _flush_pp_hidden_state_norm()
     return forward_data_store
 
 
@@ -2501,4 +2626,5 @@ def forward_backward_pipelining_without_interleaving(
     ):
         create_cudagraphs()
 
+    _flush_pp_hidden_state_norm()
     return forward_data_store
