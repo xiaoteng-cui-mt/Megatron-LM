@@ -3,6 +3,8 @@
 import contextlib
 import logging
 import os
+import logging
+import os
 from functools import partial
 from typing import Callable, Iterator, List, Optional, Union
 
@@ -42,12 +44,26 @@ Shape = Union[List[int], torch.Size]
 
 logger = logging.getLogger(__name__)
 
-_LOG_PP_HIDDEN_STATE_NORM_ENV = "MEGATRON_LOG_PP_HIDDEN_STATE_NORM"
+_LOG_PP_HIDDEN_STATE_NORM_ENV = "ENABLE_LOG_PP_HIDDEN_STATE_NORM"
+_PP_HIDDEN_STATE_NORM_THRESHOLD_ENV = "PP_HIDDEN_STATE_NORM_THRESHOLD"
 _PP_HIDDEN_STATE_NORM_STATE = {}
 
 
 def _is_pp_hidden_state_norm_enabled():
     return int(os.getenv(_LOG_PP_HIDDEN_STATE_NORM_ENV, "0")) != 0
+
+
+def _get_pp_hidden_state_norm_threshold():
+    value = os.getenv(_PP_HIDDEN_STATE_NORM_THRESHOLD_ENV, "0")
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; using 0",
+            _PP_HIDDEN_STATE_NORM_THRESHOLD_ENV,
+            value,
+        )
+        return 0.0
 
 
 def _tensor_norm_sum(output_tensor):
@@ -142,10 +158,13 @@ def _flush_pp_hidden_state_norm():
         return
 
     lines = []
+    threshold = _get_pp_hidden_state_norm_threshold()
     for (pp_rank, vp_stage), state in sorted(_PP_HIDDEN_STATE_NORM_STATE.items()):
         batch_norm_total = state["batch_norm_total"]
         if torch.is_tensor(batch_norm_total):
             batch_norm_total = batch_norm_total.detach().float().item()
+        if batch_norm_total <= threshold:
+            continue
         lines.append(
             "[pp hidden state norm summary] "
             f"rank={state.get('context', {}).get('rank')} "
@@ -157,7 +176,8 @@ def _flush_pp_hidden_state_norm():
             f"batch_norm_total={batch_norm_total:.6f} "
         )
     if lines:
-        print("\n".join(lines), flush=True)
+        log_str = "\n".join(lines)
+        print(log_str, flush=True)
     _PP_HIDDEN_STATE_NORM_STATE.clear()
 
 
