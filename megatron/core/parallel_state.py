@@ -1308,7 +1308,7 @@ def initialize_mooncake_pp_group(distributed_timeout_minutes: Optional[int] = No
     ib_hca = os.getenv('MCCL_IB_HCA', 'mlx5_bond_2,mlx5_bond_3,mlx5_bond_4,mlx5_bond_5')
     hca_list = [item.strip() for item in ib_hca.split(',') if item.strip()]
 
-    if os.getenv('MC_BIND_NIC_ZJ_ENV', '0') == '1':
+    if os.getenv('MC_BIND_NIC', '0') == '1':
         if local_rank == 0 or local_rank == 1:
             hca_list = ['mlx5_bond_2']
         elif local_rank == 2 or local_rank == 3:
